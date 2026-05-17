@@ -35,7 +35,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{ResizeDirection, Window, WindowId};
 
 const FONT_PX: f32 = 16.0;
 
@@ -110,6 +110,23 @@ impl Tree {
         match &self.nodes[id].kind {
             Kind::Leaf { workdir, command } => Some((workdir.as_path(), command.as_str())),
             _ => None,
+        }
+    }
+
+    /// Mutable handle to a leaf's default command (the inspector edits this).
+    fn command_mut(&mut self, id: NodeId) -> Option<&mut String> {
+        match &mut self.nodes[id].kind {
+            Kind::Leaf { command, .. } => Some(command),
+            _ => None,
+        }
+    }
+
+    /// Current text of an inspector field for `id`. `Command` is `None` on a
+    /// group (groups have no command — that field is shown disabled).
+    fn field_text(&self, id: NodeId, f: Field) -> Option<String> {
+        match f {
+            Field::Title => Some(self.nodes[id].name.clone()),
+            Field::Command => self.leaf_spec(id).map(|(_, c)| c.to_string()),
         }
     }
 
@@ -306,6 +323,52 @@ fn already_running(obs: &Obs, command: &str) -> bool {
         .and_then(|s| s.to_str())
         .unwrap_or(prog);
     !prog.is_empty() && obs.cmd.as_deref().is_some_and(|c| c.contains(prog))
+}
+
+/// An editable text field in the right-hand inspector.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Title,
+    Command,
+}
+
+/// A keystroke against a single-line text field, normalized away from winit.
+enum Edit {
+    Ins(char),
+    Back,
+    Del,
+    Left,
+    Right,
+    Home,
+    End,
+}
+
+/// Pure: apply one `Edit` to `(text, caret)` and return the new pair. `caret`
+/// is a character index in `0..=len`. Single-line, UTF-8 safe (operates on
+/// `char`s, not bytes). The inspector's whole editing model is this function;
+/// everything else is just plumbing keys into it and the result back out.
+fn apply_edit(text: &str, caret: usize, e: Edit) -> (String, usize) {
+    let mut v: Vec<char> = text.chars().collect();
+    let mut c = caret.min(v.len());
+    match e {
+        Edit::Ins(ch) => {
+            v.insert(c, ch);
+            c += 1;
+        }
+        Edit::Back if c > 0 => {
+            v.remove(c - 1);
+            c -= 1;
+        }
+        Edit::Del if c < v.len() => {
+            v.remove(c);
+        }
+        Edit::Left => c = c.saturating_sub(1),
+        Edit::Right if c < v.len() => c += 1,
+        Edit::Home => c = 0,
+        Edit::End => c = v.len(),
+        _ => {}
+    }
+    (v.into_iter().collect(), c)
 }
 
 /// One lifecycle effect the pure planner emits for the shell to execute.
@@ -567,6 +630,10 @@ const ROW_H: usize = 20; // one tree row
 const INDENT: usize = 14; // px added per tree depth
 const EXPANDER_W: usize = 14; // hit width of a group's [+]/[-] box
 const CTX_W: usize = 124; // context-menu width
+const RPANEL_W: usize = 252; // right inspector pane width
+const WBTN_W: usize = 30; // min/max/close button width
+const INFO_H: usize = 24; // sidebar "info" toggle band, below WORKSPACE
+const EDGE: f64 = 5.0; // borderless-window resize-grip thickness
 
 const STRIP_BG: u32 = 0xc0_c0_c0; // chrome background
 const PANEL_HI: u32 = 0xff_ff_ff; // top of a raised gradient
@@ -749,6 +816,13 @@ struct State {
     selecting: bool,
     last_click: Option<(std::time::Instant, (f64, f64))>,
     mods: ModifiersState,
+    /// Right inspector pane shown.
+    inspector: bool,
+    /// Inspector field currently captured by the keyboard (`None` = the PTY
+    /// gets keystrokes as usual).
+    focus: Option<Field>,
+    /// Caret position (char index) within the focused field.
+    caret: usize,
 }
 
 impl State {
@@ -764,10 +838,12 @@ impl State {
             .find(|l| self.sessions.contains_key(l))
     }
 
-    /// Grid size for the terminal area (window minus sidebar and header).
+    /// Grid size for the terminal area (window minus sidebar, header and —
+    /// when open — the right inspector pane).
     fn grid_size(&self, win_w: usize, win_h: usize) -> TermSize {
+        let avail = term_right(win_w, self.inspector).saturating_sub(SIDEBAR_W);
         TermSize {
-            cols: (win_w.saturating_sub(SIDEBAR_W) / self.renderer.cell_w).max(1),
+            cols: (avail / self.renderer.cell_w).max(1),
             lines: (win_h.saturating_sub(HEADER_H) / self.renderer.cell_h).max(1),
         }
     }
@@ -794,10 +870,11 @@ impl State {
     /// Hit-test a point against the sidebar tree. Returns the row's node id and
     /// whether the hit landed on a group's expander box.
     fn sidebar_hit(&self, x: f64, y: f64, rows: &[Row]) -> Option<(NodeId, bool)> {
-        if x >= SIDEBAR_W as f64 || y < HEADER_H as f64 {
+        let top = HEADER_H + INFO_H; // header band + info-toggle band
+        if x >= SIDEBAR_W as f64 || y < top as f64 {
             return None;
         }
-        let i = (y as usize - HEADER_H) / ROW_H;
+        let i = (y as usize - top) / ROW_H;
         let row = rows.get(i)?;
         let ind = row.depth * INDENT;
         let on_expander =
@@ -950,6 +1027,113 @@ impl App {
         st.window.request_redraw();
     }
 
+    /// Reflow every session's grid to the current terminal area. The window
+    /// is shared, so a resize *or* an inspector toggle reflows them all (not
+    /// just the visible one) to keep background sessions sane.
+    fn relayout(&mut self) {
+        let Some(st) = self.state.as_mut() else { return };
+        let win = st.window.inner_size();
+        let size = st.grid_size(win.width as usize, win.height as usize);
+        let ws = WindowSize {
+            num_cols: size.cols as u16,
+            num_lines: size.lines as u16,
+            cell_width: st.renderer.cell_w as u16,
+            cell_height: st.renderer.cell_h as u16,
+        };
+        for s in st.sessions.values_mut() {
+            s.tab.size = size;
+            s.tab.term.lock().resize(size);
+            let _ = s.tab.pty_tx.send(Msg::Resize(ws));
+        }
+        st.window.request_redraw();
+    }
+
+    /// Toggle the right inspector pane (and reflow the terminal into the
+    /// freed/used space). Hiding it drops keyboard focus back to the PTY.
+    fn toggle_inspector(&mut self) {
+        if let Some(st) = self.state.as_mut() {
+            st.inspector = !st.inspector;
+            if !st.inspector {
+                st.focus = None;
+            }
+        }
+        self.relayout();
+    }
+
+    /// Focus an inspector field, placing the caret under the click. `Command`
+    /// on a group is not editable, so focus is refused there.
+    fn focus_field(&mut self, f: Field, click_x: f64) {
+        let Some(st) = self.state.as_mut() else { return };
+        if f == Field::Command && st.tree.field_text(st.selected, Field::Command).is_none() {
+            st.focus = None;
+            return;
+        }
+        let text = st.tree.field_text(st.selected, f).unwrap_or_default();
+        let fr = field_rects(
+            st.window.inner_size().width as usize,
+            st.renderer.cell_h,
+        )[if f == Field::Title { 0 } else { 1 }];
+        let rel = (click_x - (fr.0 + 5) as f64).max(0.0);
+        let idx = (rel / st.renderer.cell_w as f64).round() as usize;
+        st.focus = Some(f);
+        st.caret = idx.min(text.chars().count());
+        st.window.request_redraw();
+    }
+
+    /// Apply one keystroke to the focused inspector field, writing the result
+    /// straight back into the tree (the tree is the single source of truth).
+    /// Returns `true` if the key was consumed (kept off the PTY).
+    fn edit_focused(&mut self, key: &Key, text_in: Option<&str>) -> bool {
+        let Some(st) = self.state.as_mut() else { return false };
+        let Some(f) = st.focus else { return false };
+        let sel = st.selected;
+        let e = match key {
+            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
+                st.focus = None;
+                st.window.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::Tab) => {
+                // Hop between the two fields (skip Command on a group).
+                let next = if f == Field::Title { Field::Command } else { Field::Title };
+                st.focus = (st.tree.field_text(sel, next).is_some()
+                    || next == Field::Title)
+                    .then_some(next);
+                st.caret = st
+                    .focus
+                    .and_then(|nf| st.tree.field_text(sel, nf))
+                    .map(|t| t.chars().count())
+                    .unwrap_or(0);
+                st.window.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::Backspace) => Edit::Back,
+            Key::Named(NamedKey::Delete) => Edit::Del,
+            Key::Named(NamedKey::ArrowLeft) => Edit::Left,
+            Key::Named(NamedKey::ArrowRight) => Edit::Right,
+            Key::Named(NamedKey::Home) => Edit::Home,
+            Key::Named(NamedKey::End) => Edit::End,
+            Key::Named(NamedKey::Space) => Edit::Ins(' '),
+            _ => match text_in.and_then(|t| t.chars().next()) {
+                Some(ch) if !ch.is_control() => Edit::Ins(ch),
+                _ => return true, // swallow other keys while editing
+            },
+        };
+        let cur = st.tree.field_text(sel, f).unwrap_or_default();
+        let (next, caret) = apply_edit(&cur, st.caret, e);
+        match f {
+            Field::Title => st.tree.nodes[sel].name = next,
+            Field::Command => {
+                if let Some(c) = st.tree.command_mut(sel) {
+                    *c = next;
+                }
+            }
+        }
+        st.caret = caret;
+        st.window.request_redraw();
+        true
+    }
+
     fn redraw(&mut self) {
         let Some(st) = self.state.as_mut() else { return };
         let win = st.window.inner_size();
@@ -966,6 +1150,8 @@ impl App {
 
         let cw = st.renderer.cell_w;
         let ch = st.renderer.cell_h;
+        // Right edge of the terminal: the inspector pane (if open) eats into it.
+        let tr = term_right(pw, st.inspector);
 
         // --- terminal area --------------------------------------------------
         if let Some(node) = shown {
@@ -1006,7 +1192,7 @@ impl App {
                     }
                     for gx in 0..g.w {
                         let px = x0 as i32 + g.left + gx as i32;
-                        if px < SIDEBAR_W as i32 || px as usize >= pw {
+                        if px < SIDEBAR_W as i32 || px as usize >= tr {
                             continue;
                         }
                         let a = g.bitmap[gy * g.w + gx] as u32;
@@ -1027,7 +1213,7 @@ impl App {
                 &mut st.renderer,
                 SIDEBAR_W + 10,
                 HEADER_H + 10,
-                pw.saturating_sub(SIDEBAR_W + 20),
+                tr.saturating_sub(SIDEBAR_W + 20),
                 "No session here. Right-click a node \u{2192} Start, or Ctrl+Shift+T for a shell.",
                 INK_DIM,
             );
@@ -1052,6 +1238,8 @@ impl App {
         fill_rect(&mut buf, pw, ph, SIDEBAR_W, HEADER_H - 1, pw - SIDEBAR_W, 1, BEVEL_DK);
         fill_rect(&mut buf, pw, ph, SIDEBAR_W, 0, pw - SIDEBAR_W, 1, BEVEL_LT);
         let ty = HEADER_H.saturating_sub(st.renderer.cell_h) / 2;
+        let maxed = st.window.is_maximized();
+        let [bmin, bmax, bclose] = win_btns(pw);
         draw_text(
             &mut buf,
             pw,
@@ -1059,15 +1247,47 @@ impl App {
             &mut st.renderer,
             SIDEBAR_W + 8,
             ty,
-            pw.saturating_sub(SIDEBAR_W + 16),
+            bmin.0.saturating_sub(SIDEBAR_W + 16),
             &title,
             INK,
         );
 
+        // Window controls, right-aligned in the header row.
+        for (rect, label) in [
+            (bmin, "\u{2013}"),                                // –  minimize
+            (bmax, if maxed { "\u{2750}" } else { "\u{25a1}" }), // ▢ / ❐
+            (bclose, "\u{2715}"),                              // ✕  close
+        ] {
+            draw_button(&mut buf, pw, ph, &mut st.renderer, rect, label, false);
+        }
+
         // --- sidebar tree ---------------------------------------------------
         let rows = st.tree.rows();
         let sel = st.selected;
-        draw_sidebar(&mut buf, pw, ph, &mut st.renderer, &rows, sel, &st.sessions);
+        draw_sidebar(
+            &mut buf,
+            pw,
+            ph,
+            &mut st.renderer,
+            &rows,
+            sel,
+            &st.sessions,
+            st.inspector,
+        );
+
+        // --- right inspector ------------------------------------------------
+        if st.inspector {
+            draw_inspector(
+                &mut buf,
+                pw,
+                ph,
+                &mut st.renderer,
+                &st.tree,
+                sel,
+                st.focus,
+                st.caret,
+            );
+        }
 
         // --- context menu ---------------------------------------------------
         if let Some(m) = &st.ctx {
@@ -1201,6 +1421,7 @@ fn draw_sidebar(
     rows: &[Row],
     selected: NodeId,
     sessions: &HashMap<NodeId, Session>,
+    inspector: bool,
 ) {
     fill_rect(buf, pw, ph, 0, 0, SIDEBAR_W, ph, STRIP_BG);
     // Header band, matching the terminal header height.
@@ -1211,9 +1432,11 @@ fn draw_sidebar(
     draw_text(buf, pw, ph, r, 8, ty, SIDEBAR_W - 16, "WORKSPACE", INK);
     // Hard divider between the pane and the terminal.
     fill_rect(buf, pw, ph, SIDEBAR_W - 1, 0, 1, ph, BEVEL_DK);
+    // Latched info icon directly below the WORKSPACE head.
+    draw_info_icon(buf, pw, ph, info_btn(), inspector);
 
     for (i, row) in rows.iter().enumerate() {
-        let y = HEADER_H + i * ROW_H;
+        let y = HEADER_H + INFO_H + i * ROW_H;
         if y + ROW_H > ph {
             break;
         }
@@ -1307,6 +1530,238 @@ fn ctx_item_at(m: &CtxMenu, x: f64, y: f64) -> Option<usize> {
     Some(if (y - my) < ROW_H as f64 { 0 } else { 1 })
 }
 
+/// A Win2k push-button: raised by default, sunken+inset when `pressed`
+/// (used for the latched "Properties" toggle and the window controls).
+fn draw_button(buf: &mut [u32], pw: usize, ph: usize, r: &mut Renderer, rect: Rect, label: &str, pressed: bool) {
+    let (x, y, w, h) = rect;
+    if pressed {
+        fill_rect(buf, pw, ph, x, y, w, h, PANEL_LO);
+        fill_rect(buf, pw, ph, x, y, w, 1, BEVEL_DK);
+        fill_rect(buf, pw, ph, x, y, 1, h, BEVEL_DK);
+        fill_rect(buf, pw, ph, x, y + h - 1, w, 1, BEVEL_LT);
+        fill_rect(buf, pw, ph, x + w - 1, y, 1, h, BEVEL_LT);
+    } else {
+        vgradient(buf, pw, ph, x, y, w, h, PANEL_HI, PANEL_LO);
+        stroke_rect(buf, pw, ph, x, y, w, h, BEVEL_DK);
+        fill_rect(buf, pw, ph, x, y, w, 1, BEVEL_LT);
+        fill_rect(buf, pw, ph, x, y, 1, h, BEVEL_LT);
+    }
+    let tw = label.chars().count() * r.cell_w;
+    let off = pressed as usize;
+    let tx = x + w.saturating_sub(tw) / 2 + off;
+    let ty = y + h.saturating_sub(r.cell_h) / 2 + off;
+    draw_text(buf, pw, ph, r, tx, ty, w, label, INK);
+}
+
+/// A small square info icon (1px border, a drawn "i"). Not a button: no
+/// bevel/gradient. `active` inverts it (filled box, light glyph) to show the
+/// inspector pane is open.
+fn draw_info_icon(buf: &mut [u32], pw: usize, ph: usize, rect: Rect, active: bool) {
+    let (x, y, w, h) = rect;
+    let (face, glyph) = if active { (INK, BG) } else { (BG, INK) };
+    fill_rect(buf, pw, ph, x, y, w, h, face);
+    stroke_rect(buf, pw, ph, x, y, w, h, INK);
+    // The "i": a dot near the top and a stem below, both centered.
+    let d = (w / 6).max(2);
+    let cx = x + (w - d) / 2;
+    fill_rect(buf, pw, ph, cx, y + h / 5, d, d, glyph);
+    fill_rect(buf, pw, ph, cx, y + h * 2 / 5, d, h * 2 / 5, glyph);
+}
+
+/// A sunken Win2k text box. `focused` draws the caret; `enabled` is false for
+/// the command field on a group (no command to edit).
+fn draw_field(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    r: &mut Renderer,
+    rect: Rect,
+    text: &str,
+    focused: bool,
+    caret: usize,
+    enabled: bool,
+) {
+    let (x, y, w, h) = rect;
+    fill_rect(buf, pw, ph, x, y, w, h, if enabled { BG } else { STRIP_BG });
+    // Inset bevel: shadow on top/left, highlight on bottom/right.
+    fill_rect(buf, pw, ph, x, y, w, 1, BEVEL_DK);
+    fill_rect(buf, pw, ph, x, y, 1, h, BEVEL_DK);
+    fill_rect(buf, pw, ph, x, y + h - 1, w, 1, BEVEL_LT);
+    fill_rect(buf, pw, ph, x + w - 1, y, 1, h, BEVEL_LT);
+    let tx = x + 5;
+    let ty = y + h.saturating_sub(r.cell_h) / 2;
+    draw_text(
+        buf,
+        pw,
+        ph,
+        r,
+        tx,
+        ty,
+        w.saturating_sub(10),
+        text,
+        if enabled { INK } else { INK_DIM },
+    );
+    if focused {
+        let cx = tx + caret.min(text.chars().count()) * r.cell_w;
+        fill_rect(buf, pw, ph, cx, y + 3, 1, h.saturating_sub(6), INK);
+    }
+}
+
+/// The right inspector pane: a recessed panel echoing the sidebar, with the
+/// selected node's path, an editable Title and Default-command field, and the
+/// (read-only) working directory.
+fn draw_inspector(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    r: &mut Renderer,
+    tree: &Tree,
+    sel: NodeId,
+    focus: Option<Field>,
+    caret: usize,
+) {
+    let px = panel_x(pw);
+    fill_rect(buf, pw, ph, px, 0, RPANEL_W, ph, STRIP_BG);
+    fill_rect(buf, pw, ph, px, 0, 1, ph, BEVEL_DK); // hard divider
+    vgradient(buf, pw, ph, px, 0, RPANEL_W, HEADER_H, HEAD_HI, HEAD_LO);
+    fill_rect(buf, pw, ph, px, 0, RPANEL_W, 1, BEVEL_LT);
+    fill_rect(buf, pw, ph, px, HEADER_H - 1, RPANEL_W, 1, BEVEL_DK);
+    let hty = HEADER_H.saturating_sub(r.cell_h) / 2;
+    draw_text(buf, pw, ph, r, px + 10, hty, RPANEL_W - 20, "PROPERTIES", INK);
+    draw_text(
+        buf,
+        pw,
+        ph,
+        r,
+        px + 12,
+        HEADER_H + 8,
+        RPANEL_W - 24,
+        &tree.path(sel),
+        INK_DIM,
+    );
+
+    let cell_h = r.cell_h;
+    let [tb, cb] = field_rects(pw, cell_h);
+    let lab_y = |by: usize| by.saturating_sub(cell_h + 4);
+    draw_text(buf, pw, ph, r, tb.0, lab_y(tb.1), RPANEL_W, "Title", INK);
+    draw_field(
+        buf,
+        pw,
+        ph,
+        r,
+        tb,
+        &tree.field_text(sel, Field::Title).unwrap_or_default(),
+        focus == Some(Field::Title),
+        caret,
+        true,
+    );
+
+    draw_text(buf, pw, ph, r, cb.0, lab_y(cb.1), RPANEL_W, "Default command", INK);
+    match tree.field_text(sel, Field::Command) {
+        Some(cmd) => draw_field(
+            buf,
+            pw,
+            ph,
+            r,
+            cb,
+            &cmd,
+            focus == Some(Field::Command),
+            caret,
+            true,
+        ),
+        None => draw_field(buf, pw, ph, r, cb, "(group \u{2014} no command)", false, 0, false),
+    }
+
+    if let Some((wd, _)) = tree.leaf_spec(sel) {
+        let dy = cb.1 + cb.3 + 16;
+        draw_text(buf, pw, ph, r, cb.0, dy, RPANEL_W, "Directory", INK);
+        draw_text(
+            buf,
+            pw,
+            ph,
+            r,
+            cb.0,
+            dy + r.cell_h + 4,
+            RPANEL_W - 24,
+            &wd.to_string_lossy(),
+            INK_DIM,
+        );
+    }
+}
+
+// --- chrome geometry -------------------------------------------------------
+// One source of truth for every clickable chrome rect, shared by draw and
+// hit-test (the same discipline as `Tree::rows`): a pixel can't be drawn one
+// place and clicked another.
+
+type Rect = (usize, usize, usize, usize); // x, y, w, h
+
+fn hit(r: Rect, x: f64, y: f64) -> bool {
+    x >= r.0 as f64 && x < (r.0 + r.2) as f64 && y >= r.1 as f64 && y < (r.1 + r.3) as f64
+}
+
+/// Left edge of the right inspector pane.
+fn panel_x(pw: usize) -> usize {
+    pw.saturating_sub(RPANEL_W)
+}
+
+/// Right edge of the live terminal area (shrinks when the inspector is open).
+fn term_right(pw: usize, inspector: bool) -> usize {
+    if inspector { panel_x(pw) } else { pw }
+}
+
+/// `[minimize, maximize, close]`, square, flush to the window's top-right.
+fn win_btns(pw: usize) -> [Rect; 3] {
+    let c = pw.saturating_sub(WBTN_W);
+    [
+        (c - 2 * WBTN_W, 0, WBTN_W, HEADER_H),
+        (c - WBTN_W, 0, WBTN_W, HEADER_H),
+        (c, 0, WBTN_W, HEADER_H),
+    ]
+}
+
+/// The latched info icon — a small square box, left-aligned in its own band
+/// directly below the WORKSPACE head. Filled = the inspector pane is shown.
+fn info_btn() -> Rect {
+    let s = INFO_H - 8; // square side
+    (6, HEADER_H + (INFO_H - s) / 2, s, s)
+}
+
+/// `[title box, command box]` inside the inspector pane.
+fn field_rects(pw: usize, cell_h: usize) -> [Rect; 2] {
+    let px = panel_x(pw);
+    let pad = 12;
+    let fx = px + pad;
+    let fw = RPANEL_W - pad * 2;
+    let bh = cell_h + 8;
+    // Each box sits exactly `cell_h + 4` below its label (see `lab_y`), and
+    // the first label clears the path line under the PROPERTIES head.
+    let title_lab = HEADER_H + 8 + cell_h + 10;
+    let title_y = title_lab + cell_h + 4;
+    let cmd_lab = title_y + bh + 16;
+    let cmd_y = cmd_lab + cell_h + 4;
+    [(fx, title_y, fw, bh), (fx, cmd_y, fw, bh)]
+}
+
+/// Which resize grip (if any) the point is in, for a borderless window.
+fn resize_dir(pw: usize, ph: usize, x: f64, y: f64) -> Option<ResizeDirection> {
+    let l = x < EDGE;
+    let r = x >= pw as f64 - EDGE;
+    let t = y < EDGE;
+    let b = y >= ph as f64 - EDGE;
+    Some(match (t, b, l, r) {
+        (true, _, true, _) => ResizeDirection::NorthWest,
+        (true, _, _, true) => ResizeDirection::NorthEast,
+        (_, true, true, _) => ResizeDirection::SouthWest,
+        (_, true, _, true) => ResizeDirection::SouthEast,
+        (true, ..) => ResizeDirection::North,
+        (_, true, ..) => ResizeDirection::South,
+        (_, _, true, _) => ResizeDirection::West,
+        (_, _, _, true) => ResizeDirection::East,
+        _ => return None,
+    })
+}
+
 // --- gamma-correct alpha blending (unchanged) ------------------------------
 
 /// sRGB(0..=255) -> linear-light(0..=1) lookup table. Blending glyph coverage
@@ -1362,9 +1817,15 @@ impl ApplicationHandler<UserEvent> for App {
         if self.state.is_some() {
             return;
         }
+        // No OS title bar: we draw our own in the header row to reclaim that
+        // strip of screen.
         let window = Rc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("termem"))
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("termem")
+                        .with_decorations(false),
+                )
                 .expect("create window"),
         );
         let renderer = Renderer::new();
@@ -1393,6 +1854,9 @@ impl ApplicationHandler<UserEvent> for App {
             selecting: false,
             last_click: None,
             mods: ModifiersState::empty(),
+            inspector: false,
+            focus: None,
+            caret: 0,
         };
         let size = st.grid_size(inner.width as usize, inner.height as usize);
 
@@ -1478,25 +1942,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Resized(new) => {
-                if let Some(st) = self.state.as_mut() {
-                    let size = st.grid_size(new.width as usize, new.height as usize);
-                    let ws = WindowSize {
-                        num_cols: size.cols as u16,
-                        num_lines: size.lines as u16,
-                        cell_width: st.renderer.cell_w as u16,
-                        cell_height: st.renderer.cell_h as u16,
-                    };
-                    // Every session shares the window: resize them all so
-                    // background ones stay sane.
-                    for s in st.sessions.values_mut() {
-                        s.tab.size = size;
-                        s.tab.term.lock().resize(size);
-                        let _ = s.tab.pty_tx.send(Msg::Resize(ws));
-                    }
-                    st.window.request_redraw();
-                }
-            }
+            WindowEvent::Resized(_) => self.relayout(),
             WindowEvent::ModifiersChanged(m) => {
                 if let Some(st) = self.state.as_mut() {
                     st.mods = m.state();
@@ -1524,6 +1970,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let (mx, my) = stref.mouse;
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => {
+                        let sz = self.state.as_ref().unwrap().window.inner_size();
+                        let (pw, ph) = (sz.width as usize, sz.height as usize);
+
                         // 1. A click anywhere resolves an open context menu.
                         if let Some(m) = &self.state.as_ref().unwrap().ctx {
                             let pick = ctx_item_at(m, mx, my);
@@ -1539,7 +1988,58 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // 2. Sidebar: expander toggles fold, row selects.
+                        // 2. Window controls: minimize / maximize / close.
+                        let [bmin, bmax, bclose] = win_btns(pw);
+                        if hit(bclose, mx, my) {
+                            event_loop.exit();
+                            return;
+                        }
+                        if hit(bmin, mx, my) {
+                            self.state.as_ref().unwrap().window.set_minimized(true);
+                            return;
+                        }
+                        if hit(bmax, mx, my) {
+                            let w = self.state.as_ref().unwrap().window.clone();
+                            w.set_maximized(!w.is_maximized());
+                            return;
+                        }
+                        // 3. The sidebar "info" toggle (below WORKSPACE).
+                        if hit(info_btn(), mx, my) {
+                            self.toggle_inspector();
+                            return;
+                        }
+                        // 4. Inspector pane: focus a field, else defocus.
+                        if self.state.as_ref().unwrap().inspector
+                            && mx >= panel_x(pw) as f64
+                        {
+                            let ch = self.state.as_ref().unwrap().renderer.cell_h;
+                            let [tb, cb] = field_rects(pw, ch);
+                            if hit(tb, mx, my) {
+                                self.focus_field(Field::Title, mx);
+                            } else if hit(cb, mx, my) {
+                                self.focus_field(Field::Command, mx);
+                            } else if let Some(st) = self.state.as_mut() {
+                                st.focus = None;
+                                st.window.request_redraw();
+                            }
+                            return;
+                        }
+                        // 5. Borderless-window resize grips.
+                        if let Some(dir) = resize_dir(pw, ph, mx, my) {
+                            let _ = self
+                                .state
+                                .as_ref()
+                                .unwrap()
+                                .window
+                                .drag_resize_window(dir);
+                            return;
+                        }
+                        // 6. The header row (anywhere else) drags the window.
+                        if my < HEADER_H as f64 {
+                            let _ = self.state.as_ref().unwrap().window.drag_window();
+                            return;
+                        }
+                        // 7. Sidebar: expander toggles fold, row selects.
                         let rows = self.state.as_ref().unwrap().tree.rows();
                         if let Some((node, on_exp)) =
                             self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
@@ -1550,15 +2050,21 @@ impl ApplicationHandler<UserEvent> for App {
                                 *e = !*e;
                             } else {
                                 st.selected = node;
+                                st.focus = None;
                             }
                             st.window.request_redraw();
                             return;
                         }
-                        // 3. Terminal area: start a text selection.
-                        if mx >= SIDEBAR_W as f64 && my >= HEADER_H as f64 {
+                        // 8. Terminal area: start a text selection.
+                        let tr = term_right(pw, self.state.as_ref().unwrap().inspector);
+                        if mx >= SIDEBAR_W as f64
+                            && (mx as usize) < tr
+                            && my >= HEADER_H as f64
+                        {
                             if let Some(node) = self.state.as_ref().unwrap().shown() {
                                 let now = std::time::Instant::now();
                                 let st = self.state.as_mut().unwrap();
+                                st.focus = None;
                                 let double = st.last_click.is_some_and(|(t, p)| {
                                     now.duration_since(t).as_millis() < 400
                                         && (p.0 - mx).abs() < 4.0
@@ -1593,6 +2099,7 @@ impl ApplicationHandler<UserEvent> for App {
                         {
                             let st = self.state.as_mut().unwrap();
                             st.selected = node;
+                            st.focus = None;
                             st.ctx = Some(CtxMenu {
                                 x: (mx as usize).min(SIDEBAR_W),
                                 y: my as usize,
@@ -1611,6 +2118,18 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
+                }
+                // While an inspector field is focused, the keyboard edits it
+                // instead of feeding the PTY.
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| s.inspector && s.focus.is_some())
+                {
+                    let txt = event.text.as_ref().map(|s| s.to_string());
+                    if self.edit_focused(&event.logical_key, txt.as_deref()) {
+                        return;
+                    }
                 }
                 let kmods = self.state.as_ref().map(|s| s.mods).unwrap_or_default();
                 if kmods.control_key() && kmods.shift_key() {
@@ -1840,5 +2359,38 @@ mod tests {
         let acts = plan_stop(&t, &only_a, music);
         assert_eq!(acts.len(), 1);
         assert!(matches!(acts[0], Action::Sigint(x) if x == a));
+    }
+
+    #[test]
+    fn text_field_editing_is_pure_and_utf8_safe() {
+        // Insert at caret, advancing it.
+        let (s, c) = apply_edit("ac", 1, Edit::Ins('b'));
+        assert_eq!((s.as_str(), c), ("abc", 2));
+        // Backspace removes the char before the caret.
+        let (s, c) = apply_edit("abc", 2, Edit::Back);
+        assert_eq!((s.as_str(), c), ("ac", 1));
+        // Delete removes the char at the caret; Backspace at 0 is a no-op.
+        assert_eq!(apply_edit("abc", 0, Edit::Del).0, "bc");
+        assert_eq!(apply_edit("abc", 0, Edit::Back), ("abc".to_string(), 0));
+        // Home/End/Left/Right move only the caret.
+        assert_eq!(apply_edit("abc", 1, Edit::End).1, 3);
+        assert_eq!(apply_edit("abc", 3, Edit::Right).1, 3); // clamped
+        // Caret is a *char* index, so multibyte content stays valid.
+        let (s, c) = apply_edit("é€", 2, Edit::Ins('x'));
+        assert_eq!((s.as_str(), c), ("é€x", 3));
+        let (s, _) = apply_edit("é€x", 1, Edit::Back);
+        assert_eq!(s, "€x");
+    }
+
+    #[test]
+    fn field_text_reflects_kind() {
+        let t = tree();
+        let music = group(&t, "Music");
+        let leaf = t.leaves(music)[0];
+        assert_eq!(t.field_text(leaf, Field::Title).as_deref(), Some("Hermes chat"));
+        assert_eq!(t.field_text(leaf, Field::Command).as_deref(), Some("hermes"));
+        // A group has a title but no command (that field renders disabled).
+        assert_eq!(t.field_text(music, Field::Title).as_deref(), Some("Music"));
+        assert_eq!(t.field_text(music, Field::Command), None);
     }
 }
