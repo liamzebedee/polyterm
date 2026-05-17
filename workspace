@@ -1,0 +1,19 @@
+workspaces
+	Apps
+		"qwen"	/home/liam/.apps	./run-llama.sh
+	Music
+		"Hermes chat"	~/Music	hermes
+		"Wanted music"	~/Music	"nano wanted"
+	Diabetes
+		"Meal planner"	~/Documents/projects/diabetes/mealplanner	 "bun run main.ts"
+		"Sugar tracker"	/home/liam/Documents/projects/diabetes/sugar	./run.sh
+	Morphology
+		"morpheus"	~/Documents/projects/morpheus	bash
+	HTGAA
+		"website"	/home/liam/Documents/projects/webpages	bash
+	Study
+		"Papers"	~/Documents/papers	bash
+		"Podcasts"	/home/liam/Dropbox/Notes/Obsidian/consumption/Podcasts/podcast-learn	bash
+	
+
+		

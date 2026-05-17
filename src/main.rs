@@ -1,13 +1,23 @@
-//! termem — a single-file mini terminal emulator.
+//! termem — a workspace-organized mini terminal emulator.
 //!
 //! Backend : `alacritty_terminal` (PTY + VT/ANSI state machine + parser thread)
-//! Frontend: `winit` (window + keyboard) + `softbuffer` (CPU framebuffer)
+//! Frontend: `winit` (window + keyboard/mouse) + `softbuffer` (CPU framebuffer)
 //!           + `fontdue` (glyph rasterization)
+//!
+//! Architecture is functional-core / imperative-shell:
+//!
+//!   * The workspace is a *rose tree* parsed from the `workspace` file. The
+//!     tree and every decision over it (which rows to draw, which leaves a
+//!     group contains, what to start/stop, whether something is already
+//!     running) are **pure functions** — see the `core` section.
+//!   * Only PTY spawning, byte I/O, `/proc` observation and drawing are
+//!     effectful; those live in the `shell` section (`State` / `App`).
 //!
 //! Run with: `cargo run --release`
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -29,8 +39,364 @@ use winit::window::{Window, WindowId};
 
 const FONT_PX: f32 = 16.0;
 
+// ===========================================================================
+// core — the workspace as a pure rose tree
+// ===========================================================================
+
+/// Stable identifier for a position in the tree (arena index). Stable for the
+/// lifetime of the process, including across spawn/exit of a leaf's session.
+type NodeId = usize;
+
+/// What a node *is*. `Leaf` carries the spec needed to run it.
+#[derive(Clone)]
+enum Kind {
+    /// The invisible forest root (`workspaces`).
+    Root,
+    /// A folder. May contain groups and leaves. Has no command of its own.
+    Group,
+    /// A runnable session: a working directory and a default command. An
+    /// empty `command` means "just a shell here" (Scratch/Transient/new tab).
+    Leaf { workdir: PathBuf, command: String },
+}
+
+/// One node of the workspace tree. `expanded`/`dynamic` are the only mutable
+/// bits and they are explicit, never hidden behind a traversal.
+struct Node {
+    parent: Option<NodeId>,
+    children: Vec<NodeId>,
+    name: String,
+    kind: Kind,
+    /// Groups only: whether children are shown. Ignored for leaves.
+    expanded: bool,
+    /// Created at runtime (a new scratch tab) rather than from the spec file.
+    /// Dynamic leaves are removed from the tree when their session exits.
+    dynamic: bool,
+}
+
+/// The workspace. An arena of `Node`s plus the root index. The arena layout is
+/// the idiomatic Rust spelling of an immutable-shaped tree: structure is set
+/// up once, traversals below are pure reads, mutations are localized.
+struct Tree {
+    nodes: Vec<Node>,
+    root: NodeId,
+}
+
+impl Tree {
+    fn push(&mut self, parent: Option<NodeId>, name: String, kind: Kind, dynamic: bool) -> NodeId {
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            parent,
+            children: Vec::new(),
+            name,
+            kind,
+            expanded: true,
+            dynamic,
+        });
+        if let Some(p) = parent {
+            self.nodes[p].children.push(id);
+        }
+        id
+    }
+
+    fn is_group(&self, id: NodeId) -> bool {
+        matches!(self.nodes[id].kind, Kind::Group | Kind::Root)
+    }
+    fn is_leaf(&self, id: NodeId) -> bool {
+        matches!(self.nodes[id].kind, Kind::Leaf { .. })
+    }
+
+    /// Leaf spec, if `id` is a leaf.
+    fn leaf_spec(&self, id: NodeId) -> Option<(&Path, &str)> {
+        match &self.nodes[id].kind {
+            Kind::Leaf { workdir, command } => Some((workdir.as_path(), command.as_str())),
+            _ => None,
+        }
+    }
+
+    /// DFS over visible nodes (groups gate their subtree via `expanded`). This
+    /// is the catamorphism the sidebar render and hit-testing both fold over,
+    /// so the picture on screen and the click map can never disagree.
+    fn rows(&self) -> Vec<Row> {
+        fn go(t: &Tree, id: NodeId, depth: usize, out: &mut Vec<Row>) {
+            for &c in &t.nodes[id].children {
+                let n = &t.nodes[c];
+                let is_group = matches!(n.kind, Kind::Group);
+                out.push(Row {
+                    id: c,
+                    depth,
+                    name: n.name.clone(),
+                    is_group,
+                    expanded: n.expanded,
+                    has_children: !n.children.is_empty(),
+                });
+                if is_group && n.expanded {
+                    go(t, c, depth + 1, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(self, self.root, 0, &mut out);
+        out
+    }
+
+    /// Every leaf in `id`'s subtree (a leaf yields itself). The fold that turns
+    /// "Start on a group" into "start each of these leaves".
+    fn leaves(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        fn go(t: &Tree, id: NodeId, out: &mut Vec<NodeId>) {
+            if t.is_leaf(id) {
+                out.push(id);
+                return;
+            }
+            for &c in &t.nodes[id].children {
+                go(t, c, out);
+            }
+        }
+        go(self, id, &mut out);
+        out
+    }
+
+    /// The group a new session should be attached to given the current
+    /// selection: a selected group is its own context; a selected leaf hands
+    /// off to its enclosing group.
+    fn group_for_new(&self, sel: NodeId) -> NodeId {
+        if self.is_group(sel) {
+            sel
+        } else {
+            self.nodes[sel].parent.unwrap_or(self.root)
+        }
+    }
+
+    /// First leaf in the subtree, in DFS order — used to pick what terminal to
+    /// show when a group (rather than a leaf) is selected.
+    fn first_leaf(&self, id: NodeId) -> Option<NodeId> {
+        self.leaves(id).into_iter().next()
+    }
+
+    /// `Group / Sub / Leaf` path string for the header bar.
+    fn path(&self, id: NodeId) -> String {
+        let mut parts = Vec::new();
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            if c == self.root {
+                break;
+            }
+            parts.push(self.nodes[c].name.clone());
+            cur = self.nodes[c].parent;
+        }
+        parts.reverse();
+        parts.join("  /  ")
+    }
+}
+
+/// A flattened, render-ready view of one visible tree node.
+struct Row {
+    id: NodeId,
+    depth: usize,
+    name: String,
+    is_group: bool,
+    expanded: bool,
+    has_children: bool,
+}
+
+/// Expand `~` / `~/...` to `$HOME`. Pure given `home`.
+fn expand_tilde(s: &str, home: &Path) -> PathBuf {
+    if s == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(s)
+    }
+}
+
+/// Parse the `workspace` file into a tree.
+///
+/// Format: indentation depth = tree depth (one `\t` per level). Fields on a
+/// line are tab-separated; surrounding whitespace and `"`quotes`"` are
+/// stripped. A line with a working directory + command is a `Leaf`; a bare
+/// name is a `Group`. The first non-empty line (`workspaces`) is the root
+/// sentinel. Two empty groups, `Scratch` and `Transient`, are appended as
+/// homes for ad-hoc sessions.
+fn parse_workspace(text: &str, home: &Path) -> Tree {
+    let mut tree = Tree {
+        nodes: Vec::new(),
+        root: 0,
+    };
+    let root = tree.push(None, "workspaces".into(), Kind::Root, false);
+    tree.root = root;
+
+    // stack[d] = id of the most recent node opened at depth d. A child at
+    // depth d attaches to stack[d-1]; depth 1 attaches to the root.
+    let mut stack: Vec<NodeId> = vec![root];
+
+    for raw in text.lines() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let depth = raw.chars().take_while(|&c| c == '\t').count();
+        let rest = raw.trim_start_matches('\t');
+        let fields: Vec<String> = rest
+            .split('\t')
+            .map(|f| f.trim().trim_matches('"').trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
+        if fields.is_empty() {
+            continue;
+        }
+        if depth == 0 {
+            // The `workspaces` root line; already created.
+            continue;
+        }
+        let parent = *stack.get(depth - 1).unwrap_or(&root);
+        let id = if fields.len() >= 3 {
+            // name, workdir, command  -> a runnable leaf
+            let workdir = expand_tilde(&fields[1], home);
+            tree.push(
+                Some(parent),
+                fields[0].clone(),
+                Kind::Leaf {
+                    workdir,
+                    command: fields[2].clone(),
+                },
+                false,
+            )
+        } else {
+            // bare name -> a group
+            tree.push(Some(parent), fields[0].clone(), Kind::Group, false)
+        };
+        stack.truncate(depth);
+        stack.push(id);
+    }
+
+    for name in ["Scratch", "Transient"] {
+        tree.push(Some(root), name.into(), Kind::Group, false);
+    }
+    tree
+}
+
+/// What the shell observed about a session's PTY, gathered from `/proc`.
+/// Effectful to *produce* (`observe`), but a plain value the planner reasons
+/// about purely.
+#[derive(Clone, Default)]
+struct Obs {
+    /// The shell has a foreground child — i.e. a command is running, not just
+    /// an idle prompt.
+    foreground: bool,
+    cmd: Option<String>,
+}
+
+/// Pure predicate: should `plan_start` *skip* running `command` here because
+/// it's already running? True when the shell has a foreground job whose
+/// command line mentions the configured program. Conservative: if we can't
+/// tell, we don't skip (running again is recoverable with Ctrl+C; silently
+/// not starting is not).
+fn already_running(obs: &Obs, command: &str) -> bool {
+    if !obs.foreground || command.trim().is_empty() {
+        return false;
+    }
+    let prog = command
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches("./");
+    let prog = Path::new(prog)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(prog);
+    !prog.is_empty() && obs.cmd.as_deref().is_some_and(|c| c.contains(prog))
+}
+
+/// One lifecycle effect the pure planner emits for the shell to execute.
+#[derive(Clone)]
+enum Action {
+    /// Spawn an idle PTY for this leaf (sets cwd, runs no command).
+    Spawn(NodeId),
+    /// Type the leaf's default command + Enter into its session.
+    Run(NodeId),
+    /// Send Ctrl+C to the leaf's session.
+    Sigint(NodeId),
+}
+
+/// Pure: starting `target` means, for every leaf under it, ensuring a session
+/// exists and then running its command unless it's already running. Spawn
+/// precedes Run for the same leaf so a re-started (previously exited) spec
+/// leaf comes back. Groups fan out to all descendant leaves — each runs in its
+/// own PTY thread, so this is parallel for free.
+fn plan_start(
+    tree: &Tree,
+    has_session: &dyn Fn(NodeId) -> bool,
+    obs: &HashMap<NodeId, Obs>,
+    target: NodeId,
+) -> Vec<Action> {
+    let mut acts = Vec::new();
+    for leaf in tree.leaves(target) {
+        let Some((_, command)) = tree.leaf_spec(leaf) else {
+            continue;
+        };
+        if !has_session(leaf) {
+            acts.push(Action::Spawn(leaf));
+        } else if obs.get(&leaf).is_some_and(|o| already_running(o, command)) {
+            continue;
+        }
+        if !command.trim().is_empty() {
+            acts.push(Action::Run(leaf));
+        }
+    }
+    acts
+}
+
+/// Pure: stopping `target` sends Ctrl+C to every leaf under it that has a live
+/// session.
+fn plan_stop(tree: &Tree, has_session: &dyn Fn(NodeId) -> bool, target: NodeId) -> Vec<Action> {
+    tree.leaves(target)
+        .into_iter()
+        .filter(|&l| has_session(l))
+        .map(Action::Sigint)
+        .collect()
+}
+
+/// Walk `/proc` to see what a PTY's shell is doing. Linux-only and best-effort
+/// — any failure degrades to "nothing observed" (`Obs::default`), which the
+/// planner treats as "not running".
+fn observe(shell_pid: u32) -> Obs {
+    fn children(pid: u32) -> Vec<u32> {
+        std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            .ok()
+            .map(|s| s.split_whitespace().filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_default()
+    }
+    // Descend to the deepest foreground descendant of the shell.
+    let mut cur = shell_pid;
+    loop {
+        match children(cur).first() {
+            Some(&c) => cur = c,
+            None => break,
+        }
+    }
+    if cur == shell_pid {
+        return Obs::default();
+    }
+    let cmd = std::fs::read(format!("/proc/{cur}/cmdline")).ok().map(|b| {
+        b.split(|&c| c == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    Obs {
+        foreground: true,
+        cmd: cmd.filter(|s| !s.is_empty()),
+    }
+}
+
+// ===========================================================================
+// terminal session plumbing (unchanged core, generalized to take a cwd)
+// ===========================================================================
+
 /// Userland event from a PTY parser thread. Each event carries the id of the
-/// tab it originated from so the GUI thread can route it to the right session.
+/// session it originated from so the GUI thread can route it.
 #[derive(Debug, Clone)]
 enum UserEvent {
     Wakeup,
@@ -39,10 +405,9 @@ enum UserEvent {
     ResetTitle(u64),
 }
 
-/// `EventListener` impl handed to `alacritty_terminal`. It forwards the few
-/// events we care about onto the winit event loop so the GUI thread can react
-/// (redraw / retitle / close tab). It must be `Clone + Send` because the PTY
-/// runs on its own thread. `id` ties events back to the owning tab.
+/// `EventListener` impl handed to `alacritty_terminal`. Forwards the events we
+/// care about onto the winit loop. `Clone + Send` (the PTY runs on its own
+/// thread); `id` ties events back to the owning session.
 #[derive(Clone)]
 struct Listener {
     proxy: EventLoopProxy<UserEvent>,
@@ -157,8 +522,6 @@ impl Renderer {
 /// that cover symbols/emoji the monospace font is missing. De-dups by path
 /// and always tries DejaVu as a last resort.
 fn load_fonts() -> Vec<Vec<u8>> {
-    // fontconfig patterns, in priority order. The first must be monospace
-    // (it defines the cell grid); the rest are coverage fallbacks.
     let patterns = [
         "monospace",
         "Noto Sans Symbols2",
@@ -179,10 +542,7 @@ fn load_fonts() -> Vec<Vec<u8>> {
             }
         }
     }
-    let mut fonts: Vec<Vec<u8>> = paths
-        .iter()
-        .filter_map(|p| std::fs::read(p).ok())
-        .collect();
+    let mut fonts: Vec<Vec<u8>> = paths.iter().filter_map(|p| std::fs::read(p).ok()).collect();
     if fonts.is_empty() {
         fonts.push(
             std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
@@ -197,23 +557,27 @@ const FG: u32 = 0x1a_1a_1a;
 const BG: u32 = 0xff_ff_ff;
 const SEL: u32 = 0xbf_d9_f2;
 
-// --- Tab bar chrome ---------------------------------------------------------
+// --- Win2k chrome ----------------------------------------------------------
 // Windows 2000 design *principles* (not its colours): explicit borders and
-// bevels, a subtle vertical gradient, compact fixed height, dense layout,
+// bevels, a subtle vertical gradient, compact fixed heights, dense layout,
 // left-aligned titles.
-const TAB_BAR_H: usize = 26; // fixed height, in pixels
-const TAB_W: usize = 168; // fixed per-tab width
-const TAB_PAD_X: usize = 8; // text inset from the tab's left edge
+const SIDEBAR_W: usize = 212; // fixed-width tree pane
+const HEADER_H: usize = 24; // title bar over the terminal & sidebar head
+const ROW_H: usize = 20; // one tree row
+const INDENT: usize = 14; // px added per tree depth
+const EXPANDER_W: usize = 14; // hit width of a group's [+]/[-] box
+const CTX_W: usize = 124; // context-menu width
 
-const STRIP_BG: u32 = 0xc0_c0_c0; // tab-bar background behind the tabs
-const TAB_HI: u32 = 0xff_ff_ff; // top of an active tab's gradient
-const TAB_LO: u32 = 0xe4_e4_e4; // bottom of an active tab's gradient
-const TAB_INACT_HI: u32 = 0xd9_d9_d9; // top of an inactive tab's gradient
-const TAB_INACT_LO: u32 = 0xbe_be_be; // bottom of an inactive tab's gradient
+const STRIP_BG: u32 = 0xc0_c0_c0; // chrome background
+const PANEL_HI: u32 = 0xff_ff_ff; // top of a raised gradient
+const PANEL_LO: u32 = 0xe4_e4_e4; // bottom of a raised gradient
+const HEAD_HI: u32 = 0xd9_d9_d9; // header gradient top
+const HEAD_LO: u32 = 0xbe_be_be; // header gradient bottom
 const BEVEL_LT: u32 = 0xff_ff_ff; // raised highlight (top/left)
 const BEVEL_DK: u32 = 0x80_80_80; // raised shadow (bottom/right)
-const TAB_FG: u32 = 0x1a_1a_1a; // active tab title
-const TAB_FG_DIM: u32 = 0x5a_5a_5a; // inactive tab title
+const INK: u32 = 0x1a_1a_1a; // primary chrome text
+const INK_DIM: u32 = 0x5a_5a_5a; // secondary chrome text
+const RUN_INK: u32 = 0x10_7c_10; // "running" marker (green square)
 
 /// Map a terminal color to RGB. A compact, good-enough palette.
 fn rgb(color: Color, default: u32) -> u32 {
@@ -292,23 +656,26 @@ const ANSI16: [NamedColor; 16] = [
 ];
 
 /// One terminal session: its own PTY thread + VT state machine + grid size.
+/// Reused as-is; `spawn_session` now also returns the shell pid for `/proc`.
 struct Tab {
-    id: u64,
     term: Arc<FairMutex<Term<Listener>>>,
     pty_tx: EventLoopSender,
     size: TermSize,
     title: String,
 }
 
-/// Spawn a fresh PTY-backed terminal session sized to the current window.
-fn spawn_tab(
+/// Spawn a fresh PTY-backed terminal session in `workdir`, sized to the
+/// current terminal area. Runs no command — it only lands a shell in the right
+/// directory. Returns the session and the shell's pid (for `observe`).
+fn spawn_session(
     proxy: &EventLoopProxy<UserEvent>,
     id: u64,
-    label_n: u64,
+    title: String,
+    workdir: Option<PathBuf>,
     size: TermSize,
     cell_w: usize,
     cell_h: usize,
-) -> Tab {
+) -> (Tab, u32) {
     let window_size = WindowSize {
         num_cols: size.cols as u16,
         num_lines: size.lines as u16,
@@ -321,30 +688,62 @@ fn spawn_tab(
     };
     let term = Term::new(Config::default(), &size, listener.clone());
     let term = Arc::new(FairMutex::new(term));
-    let pty = tty::new(&PtyOptions::default(), window_size, 0).expect("spawn pty");
-    let pty_loop = PtyEventLoop::new(term.clone(), listener, pty, false, false)
-        .expect("create pty event loop");
+
+    let opts = PtyOptions {
+        working_directory: workdir.filter(|p| p.is_dir()),
+        ..PtyOptions::default()
+    };
+    let pty = tty::new(&opts, window_size, 0)
+        .or_else(|_| tty::new(&PtyOptions::default(), window_size, 0))
+        .expect("spawn pty");
+    // Capture the child shell pid before the event loop takes ownership.
+    let pid = pty.child().id();
+
+    let pty_loop =
+        PtyEventLoop::new(term.clone(), listener, pty, false, false).expect("create pty event loop");
     let pty_tx = pty_loop.channel();
     pty_loop.spawn();
-    Tab {
-        id,
-        term,
-        pty_tx,
-        size,
-        title: format!("Terminal {label_n}"),
-    }
+    (
+        Tab {
+            term,
+            pty_tx,
+            size,
+            title,
+        },
+        pid,
+    )
 }
 
-/// Everything that only exists once the window is created. The terminal area
-/// is offset down by `TAB_BAR_H` to make room for the tab strip.
+/// A live session bound to a leaf node.
+struct Session {
+    tab: Tab,
+    shell_pid: u32,
+}
+
+// ===========================================================================
+// shell — window state and the winit application
+// ===========================================================================
+
+/// State of an open right-click menu: where it was opened and on which node.
+struct CtxMenu {
+    x: usize,
+    y: usize,
+    node: NodeId,
+}
+
+/// Everything that exists once the window is created.
 struct State {
     window: Rc<Window>,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
     renderer: Renderer,
-    tabs: Vec<Tab>,
-    active: usize,
+    tree: Tree,
+    /// Leaf node -> its live PTY session. Absent = idle/never-started.
+    sessions: HashMap<NodeId, Session>,
+    /// PTY event id -> owning leaf node, for routing parser-thread events.
+    id_of: HashMap<u64, NodeId>,
+    selected: NodeId,
     next_id: u64,
-    next_label: u64,
+    ctx: Option<CtxMenu>,
     clipboard: Option<arboard::Clipboard>,
     mouse: (f64, f64),
     selecting: bool,
@@ -353,55 +752,57 @@ struct State {
 }
 
 impl State {
-    fn tab(&self) -> &Tab {
-        &self.tabs[self.active]
-    }
-
-    /// Pixel rect of tab `i` in the strip: `(x0, width)`.
-    fn tab_rect(i: usize) -> (usize, usize) {
-        (i * TAB_W, TAB_W)
-    }
-
-    /// If `x,y` falls on a tab in the strip, return its index.
-    fn tab_at(&self, x: f64, y: f64) -> Option<usize> {
-        if y < 0.0 || y >= TAB_BAR_H as f64 {
-            return None;
+    /// Which leaf's terminal to show: the selection if it is a leaf with a
+    /// session, otherwise the first session-bearing leaf under the selection.
+    fn shown(&self) -> Option<NodeId> {
+        if self.tree.is_leaf(self.selected) && self.sessions.contains_key(&self.selected) {
+            return Some(self.selected);
         }
-        let i = (x as usize) / TAB_W;
-        (i < self.tabs.len()).then_some(i)
+        self.tree
+            .leaves(self.selected)
+            .into_iter()
+            .find(|l| self.sessions.contains_key(l))
     }
 
-    /// Convert a pixel position in the window to a grid `Point` (accounting
-    /// for the tab bar offset and scrollback display offset) plus cell half.
-    fn pixel_to_point(&self, term: &Term<Listener>) -> (Point, Side) {
-        let size = self.tab().size;
+    /// Grid size for the terminal area (window minus sidebar and header).
+    fn grid_size(&self, win_w: usize, win_h: usize) -> TermSize {
+        TermSize {
+            cols: (win_w.saturating_sub(SIDEBAR_W) / self.renderer.cell_w).max(1),
+            lines: (win_h.saturating_sub(HEADER_H) / self.renderer.cell_h).max(1),
+        }
+    }
+
+    /// Convert the mouse position to a grid `Point` within the shown terminal,
+    /// accounting for the sidebar/header offset and scrollback.
+    fn pixel_to_point(&self, term: &Term<Listener>, size: TermSize) -> (Point, Side) {
         let cw = self.renderer.cell_w as f64;
         let ch = self.renderer.cell_h as f64;
-        let my = (self.mouse.1 - TAB_BAR_H as f64).max(0.0);
-        let col = ((self.mouse.0 / cw) as usize).min(size.cols.saturating_sub(1));
+        let mx = (self.mouse.0 - SIDEBAR_W as f64).max(0.0);
+        let my = (self.mouse.1 - HEADER_H as f64).max(0.0);
+        let col = ((mx / cw) as usize).min(size.cols.saturating_sub(1));
         let row = ((my / ch) as usize).min(size.lines.saturating_sub(1));
         let offset = term.grid().display_offset() as i32;
         let line = Line(row as i32 - offset);
-        let frac = (self.mouse.0 / cw).fract();
-        let side = if frac < 0.5 { Side::Left } else { Side::Right };
+        let side = if (mx / cw).fract() < 0.5 {
+            Side::Left
+        } else {
+            Side::Right
+        };
         (Point::new(line, Column(col)), side)
     }
 
-    fn copy_selection(&mut self) {
-        let text = self.tabs[self.active].term.lock().selection_to_string();
-        if let (Some(text), Some(cb)) = (text, self.clipboard.as_mut()) {
-            if !text.is_empty() {
-                let _ = cb.set_text(text);
-            }
+    /// Hit-test a point against the sidebar tree. Returns the row's node id and
+    /// whether the hit landed on a group's expander box.
+    fn sidebar_hit(&self, x: f64, y: f64, rows: &[Row]) -> Option<(NodeId, bool)> {
+        if x >= SIDEBAR_W as f64 || y < HEADER_H as f64 {
+            return None;
         }
-    }
-
-    /// Grid size for the current window, with the tab bar carved off the top.
-    fn grid_size(&self, win_w: usize, win_h: usize) -> TermSize {
-        TermSize {
-            cols: (win_w / self.renderer.cell_w).max(1),
-            lines: (win_h.saturating_sub(TAB_BAR_H) / self.renderer.cell_h).max(1),
-        }
+        let i = (y as usize - HEADER_H) / ROW_H;
+        let row = rows.get(i)?;
+        let ind = row.depth * INDENT;
+        let on_expander =
+            row.is_group && (x as usize) >= ind && (x as usize) < ind + EXPANDER_W;
+        Some((row.id, on_expander))
     }
 }
 
@@ -411,162 +812,285 @@ struct App {
 }
 
 impl App {
+    /// Run a session-lifecycle plan: spawn/run/sigint each action in order.
+    fn apply(&mut self, acts: Vec<Action>) {
+        for act in acts {
+            match act {
+                Action::Spawn(node) => self.spawn_for(node),
+                Action::Run(node) => {
+                    if let Some((_, cmd)) = self
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.tree.leaf_spec(node).map(|(w, c)| (w, c.to_string())))
+                    {
+                        self.send_to(node, format!("{cmd}\r").into_bytes());
+                    }
+                }
+                Action::Sigint(node) => self.send_to(node, vec![0x03]),
+            }
+        }
+        if let Some(st) = &self.state {
+            st.window.request_redraw();
+        }
+    }
+
+    /// Effect: spawn an idle PTY for leaf `node` in its workdir.
+    fn spawn_for(&mut self, node: NodeId) {
+        let Some(st) = self.state.as_mut() else { return };
+        if st.sessions.contains_key(&node) {
+            return;
+        }
+        let (Some((workdir, _)), name) = (
+            st.tree.leaf_spec(node).map(|(w, c)| (w.to_path_buf(), c)),
+            st.tree.nodes[node].name.clone(),
+        ) else {
+            return;
+        };
+        let win = st.window.inner_size();
+        let size = st.grid_size(win.width as usize, win.height as usize);
+        let id = st.next_id;
+        st.next_id += 1;
+        let (tab, pid) = spawn_session(
+            &self.proxy,
+            id,
+            name,
+            Some(workdir),
+            size,
+            st.renderer.cell_w,
+            st.renderer.cell_h,
+        );
+        st.id_of.insert(id, node);
+        st.sessions.insert(node, Session { tab, shell_pid: pid });
+    }
+
+    fn send_to(&self, node: NodeId, bytes: Vec<u8>) {
+        if let Some(s) = self.state.as_ref().and_then(|st| st.sessions.get(&node)) {
+            let _ = s.tab.pty_tx.send(Msg::Input(bytes.into()));
+        }
+    }
+
+    /// Observe every live session's `/proc` state so the pure planners can
+    /// decide what's already running.
+    fn observations(&self) -> HashMap<NodeId, Obs> {
+        self.state
+            .as_ref()
+            .map(|st| {
+                st.sessions
+                    .iter()
+                    .map(|(&n, s)| (n, observe(s.shell_pid)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn start(&mut self, target: NodeId) {
+        let obs = self.observations();
+        let acts = {
+            let st = self.state.as_ref().unwrap();
+            let has = |n: NodeId| st.sessions.contains_key(&n);
+            plan_start(&st.tree, &has, &obs, target)
+        };
+        self.apply(acts);
+    }
+
+    fn stop(&mut self, target: NodeId) {
+        let acts = {
+            let st = self.state.as_ref().unwrap();
+            let has = |n: NodeId| st.sessions.contains_key(&n);
+            plan_stop(&st.tree, &has, target)
+        };
+        self.apply(acts);
+    }
+
+    /// Create a scratch session under the group of the current selection (a
+    /// selected group is its own target; Scratch/Transient are valid). It
+    /// inherits the selected leaf's directory, else `$HOME`.
+    fn new_scratch(&mut self) {
+        let Some(st) = self.state.as_mut() else { return };
+        let group = st.tree.group_for_new(st.selected);
+        let home = home_dir();
+        let cwd = st
+            .tree
+            .leaf_spec(st.selected)
+            .map(|(w, _)| w.to_path_buf())
+            .unwrap_or(home);
+        let n = st.tree.nodes[group].children.len() + 1;
+        let node = st.tree.push(
+            Some(group),
+            format!("{} {n}", st.tree.nodes[group].name),
+            Kind::Leaf {
+                workdir: cwd,
+                command: String::new(),
+            },
+            true,
+        );
+        st.tree.nodes[group].expanded = true;
+        st.selected = node;
+        self.spawn_for(node);
+        if let Some(st) = &self.state {
+            st.window.request_redraw();
+        }
+    }
+
+    /// Tear down the selected session. Dynamic (scratch) leaves are removed
+    /// from the tree; spec leaves stay so they can be re-started.
+    fn close_selected(&mut self) {
+        let Some(st) = self.state.as_mut() else { return };
+        let node = st.selected;
+        if let Some(s) = st.sessions.remove(&node) {
+            let _ = s.tab.pty_tx.send(Msg::Shutdown);
+            st.id_of.retain(|_, &mut v| v != node);
+        }
+        if st.tree.nodes[node].dynamic {
+            if let Some(p) = st.tree.nodes[node].parent {
+                st.tree.nodes[p].children.retain(|&c| c != node);
+                st.selected = p;
+            }
+        }
+        st.window.request_redraw();
+    }
+
     fn redraw(&mut self) {
         let Some(st) = self.state.as_mut() else { return };
         let win = st.window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(win.width), NonZeroU32::new(win.height)) else {
             return;
         };
+        // `shown()` borrows all of `State`; resolve it before the framebuffer
+        // takes a (disjoint, but whole-`self`-incompatible) mutable borrow.
+        let shown = st.shown();
         st.surface.resize(w, h).unwrap();
         let mut buf = st.surface.buffer_mut().unwrap();
         let (pw, ph) = (win.width as usize, win.height as usize);
         buf.fill(BG);
 
-        let term = st.tabs[st.active].term.lock();
-        let content = term.renderable_content();
-        let cursor = content.cursor.point;
-        let selection = content.selection;
         let cw = st.renderer.cell_w;
         let ch = st.renderer.cell_h;
 
-        for cell in content.display_iter {
-            let line = cell.point.line.0;
-            if line < 0 {
-                continue; // scrollback above viewport
-            }
-            let col = cell.point.column.0;
-            let x0 = col * cw;
-            let y0 = TAB_BAR_H + line as usize * ch;
-
-            let is_cursor = cell.point.line == cursor.line && cell.point.column == cursor.column;
-            let selected = selection.map_or(false, |s| s.contains(cell.point));
-            let mut fg = rgb(cell.fg, FG);
-            let mut bg = rgb(cell.bg, BG);
-            if is_cursor {
-                std::mem::swap(&mut fg, &mut bg);
-            } else if selected {
-                bg = SEL;
-            }
-
-            // Cell background.
-            if bg != BG {
-                fill_rect(&mut buf, pw, ph, x0, y0, cw, ch, bg);
-            }
-
-            let c = cell.c;
-            if c == ' ' || c == '\0' {
-                continue;
-            }
-            let g = st.renderer.glyph(c);
-            for gy in 0..g.h {
-                let py = y0 as i32 + g.top + gy as i32;
-                if py < 0 || py as usize >= ph {
+        // --- terminal area --------------------------------------------------
+        if let Some(node) = shown {
+            let term = st.sessions[&node].tab.term.lock();
+            let content = term.renderable_content();
+            let cursor = content.cursor.point;
+            let selection = content.selection;
+            for cell in content.display_iter {
+                let line = cell.point.line.0;
+                if line < 0 {
                     continue;
                 }
-                for gx in 0..g.w {
-                    let px = x0 as i32 + g.left + gx as i32;
-                    if px < 0 || px as usize >= pw {
+                let col = cell.point.column.0;
+                let x0 = SIDEBAR_W + col * cw;
+                let y0 = HEADER_H + line as usize * ch;
+                let is_cursor =
+                    cell.point.line == cursor.line && cell.point.column == cursor.column;
+                let selected = selection.is_some_and(|s| s.contains(cell.point));
+                let mut fg = rgb(cell.fg, FG);
+                let mut bg = rgb(cell.bg, BG);
+                if is_cursor {
+                    std::mem::swap(&mut fg, &mut bg);
+                } else if selected {
+                    bg = SEL;
+                }
+                if bg != BG {
+                    fill_rect(&mut buf, pw, ph, x0, y0, cw, ch, bg);
+                }
+                let c = cell.c;
+                if c == ' ' || c == '\0' {
+                    continue;
+                }
+                let g = st.renderer.glyph(c);
+                for gy in 0..g.h {
+                    let py = y0 as i32 + g.top + gy as i32;
+                    if py < 0 || py as usize >= ph {
                         continue;
                     }
-                    let a = g.bitmap[gy * g.w + gx] as u32;
-                    if a == 0 {
-                        continue;
+                    for gx in 0..g.w {
+                        let px = x0 as i32 + g.left + gx as i32;
+                        if px < SIDEBAR_W as i32 || px as usize >= pw {
+                            continue;
+                        }
+                        let a = g.bitmap[gy * g.w + gx] as u32;
+                        if a == 0 {
+                            continue;
+                        }
+                        let idx = py as usize * pw + px as usize;
+                        buf[idx] = blend(fg, buf[idx], a);
                     }
-                    let idx = py as usize * pw + px as usize;
-                    buf[idx] = blend(fg, buf[idx], a);
                 }
             }
+            drop(term);
+        } else {
+            draw_text(
+                &mut buf,
+                pw,
+                ph,
+                &mut st.renderer,
+                SIDEBAR_W + 10,
+                HEADER_H + 10,
+                pw.saturating_sub(SIDEBAR_W + 20),
+                "No session here. Right-click a node \u{2192} Start, or Ctrl+Shift+T for a shell.",
+                INK_DIM,
+            );
         }
 
-        drop(term);
-
-        draw_tab_bar(
+        // --- header bar over the terminal ----------------------------------
+        let running = shown.is_some_and(|n| {
+            st.sessions
+                .get(&n)
+                .map(|s| observe(s.shell_pid).foreground)
+                .unwrap_or(false)
+        });
+        let title = match shown {
+            Some(n) => format!(
+                "{}      [{}]",
+                st.tree.path(n),
+                if running { "running" } else { "idle" }
+            ),
+            None => "termem".to_string(),
+        };
+        vgradient(&mut buf, pw, ph, SIDEBAR_W, 0, pw - SIDEBAR_W, HEADER_H, HEAD_HI, HEAD_LO);
+        fill_rect(&mut buf, pw, ph, SIDEBAR_W, HEADER_H - 1, pw - SIDEBAR_W, 1, BEVEL_DK);
+        fill_rect(&mut buf, pw, ph, SIDEBAR_W, 0, pw - SIDEBAR_W, 1, BEVEL_LT);
+        let ty = HEADER_H.saturating_sub(st.renderer.cell_h) / 2;
+        draw_text(
             &mut buf,
             pw,
             ph,
             &mut st.renderer,
-            &st.tabs,
-            st.active,
+            SIDEBAR_W + 8,
+            ty,
+            pw.saturating_sub(SIDEBAR_W + 16),
+            &title,
+            INK,
         );
+
+        // --- sidebar tree ---------------------------------------------------
+        let rows = st.tree.rows();
+        let sel = st.selected;
+        draw_sidebar(&mut buf, pw, ph, &mut st.renderer, &rows, sel, &st.sessions);
+
+        // --- context menu ---------------------------------------------------
+        if let Some(m) = &st.ctx {
+            draw_ctx_menu(&mut buf, pw, ph, &mut st.renderer, m.x, m.y);
+        }
 
         buf.present().unwrap();
     }
 
     fn send(&self, bytes: Vec<u8>) {
-        if let Some(st) = &self.state {
-            let _ = st.tabs[st.active].pty_tx.send(Msg::Input(bytes.into()));
-        }
-    }
-
-    /// Open a new tab next to the active one and focus it.
-    fn new_tab(&mut self) {
-        let Some(st) = self.state.as_mut() else { return };
-        let win = st.window.inner_size();
-        let size = st.grid_size(win.width as usize, win.height as usize);
-        let id = st.next_id;
-        let label = st.next_label;
-        st.next_id += 1;
-        st.next_label += 1;
-        let tab = spawn_tab(
-            &self.proxy,
-            id,
-            label,
-            size,
-            st.renderer.cell_w,
-            st.renderer.cell_h,
-        );
-        let at = st.active + 1;
-        st.tabs.insert(at, tab);
-        st.active = at;
-        st.window.request_redraw();
-    }
-
-    /// Close a tab by index. Shuts its PTY down. Returns `true` when that was
-    /// the last tab and the caller should exit the app.
-    fn close_tab(&mut self, idx: usize) -> bool {
-        let Some(st) = self.state.as_mut() else {
-            return false;
-        };
-        if idx >= st.tabs.len() {
-            return false;
-        }
-        let tab = st.tabs.remove(idx);
-        let _ = tab.pty_tx.send(Msg::Shutdown);
-        if st.tabs.is_empty() {
-            return true;
-        }
-        if st.active >= st.tabs.len() {
-            st.active = st.tabs.len() - 1;
-        } else if idx < st.active {
-            st.active -= 1;
-        }
-        st.window.request_redraw();
-        false
-    }
-
-    fn select_tab(&mut self, idx: usize) {
-        if let Some(st) = self.state.as_mut() {
-            if idx < st.tabs.len() && idx != st.active {
-                st.active = idx;
-                st.window.request_redraw();
-            }
-        }
-    }
-
-    /// Cycle the focused tab by `delta` (+1 next, -1 previous), wrapping.
-    fn cycle_tab(&mut self, delta: isize) {
-        if let Some(st) = self.state.as_mut() {
-            let n = st.tabs.len() as isize;
-            if n > 1 {
-                st.active = (((st.active as isize + delta) % n + n) % n) as usize;
-                st.window.request_redraw();
-            }
+        if let Some(node) = self.state.as_ref().and_then(|s| s.shown()) {
+            self.send_to(node, bytes);
         }
     }
 
     fn copy_to_clipboard(&mut self) {
-        if let Some(st) = self.state.as_mut() {
-            st.copy_selection();
+        let Some(st) = self.state.as_mut() else { return };
+        let Some(node) = st.shown() else { return };
+        let text = st.sessions[&node].tab.term.lock().selection_to_string();
+        if let (Some(text), Some(cb)) = (text, st.clipboard.as_mut()) {
+            if !text.is_empty() {
+                let _ = cb.set_text(text);
+            }
         }
     }
 
@@ -577,23 +1101,14 @@ impl App {
             .and_then(|st| st.clipboard.as_mut())
             .and_then(|cb| cb.get_text().ok());
         if let Some(text) = text {
-            // Bracketed paste keeps shells from interpreting newlines as Enter
-            // is left to the app; send raw, which is fine for a demo.
             self.send(text.replace('\n', "\r").into_bytes());
         }
     }
 }
 
-fn fill_rect(
-    buf: &mut [u32],
-    pw: usize,
-    ph: usize,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    color: u32,
-) {
+// --- drawing helpers (unchanged) -------------------------------------------
+
+fn fill_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
     for yy in y..(y + h).min(ph) {
         for xx in x..(x + w).min(pw) {
             buf[yy * pw + xx] = color;
@@ -625,10 +1140,10 @@ fn stroke_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usi
     if w == 0 || h == 0 {
         return;
     }
-    fill_rect(buf, pw, ph, x, y, w, 1, color); // top
-    fill_rect(buf, pw, ph, x, y + h - 1, w, 1, color); // bottom
-    fill_rect(buf, pw, ph, x, y, 1, h, color); // left
-    fill_rect(buf, pw, ph, x + w - 1, y, 1, h, color); // right
+    fill_rect(buf, pw, ph, x, y, w, 1, color);
+    fill_rect(buf, pw, ph, x, y + h - 1, w, 1, color);
+    fill_rect(buf, pw, ph, x, y, 1, h, color);
+    fill_rect(buf, pw, ph, x + w - 1, y, 1, h, color);
 }
 
 /// Draw a left-aligned monospace string, clipped to `max_w` pixels.
@@ -675,59 +1190,128 @@ fn draw_text(
     }
 }
 
-/// Render the horizontal tab strip: a recessed background, then one bevelled,
-/// gradient-filled tab per session with a left-aligned title. The active tab
-/// reads "raised", inactive tabs sit flush and dimmed.
-fn draw_tab_bar(
+/// The left tree pane: a recessed panel with a Win2k head, one fixed-height
+/// bevelled row per visible node, boxed `[+]/[-]` expanders for groups, a
+/// run-state marker for leaves, and a raised selection highlight.
+fn draw_sidebar(
     buf: &mut [u32],
     pw: usize,
     ph: usize,
     r: &mut Renderer,
-    tabs: &[Tab],
-    active: usize,
+    rows: &[Row],
+    selected: NodeId,
+    sessions: &HashMap<NodeId, Session>,
 ) {
-    // Recessed strip background + a hard bottom border under the whole bar.
-    fill_rect(buf, pw, ph, 0, 0, pw, TAB_BAR_H, STRIP_BG);
-    fill_rect(buf, pw, ph, 0, TAB_BAR_H - 1, pw, 1, BEVEL_DK);
+    fill_rect(buf, pw, ph, 0, 0, SIDEBAR_W, ph, STRIP_BG);
+    // Header band, matching the terminal header height.
+    vgradient(buf, pw, ph, 0, 0, SIDEBAR_W, HEADER_H, HEAD_HI, HEAD_LO);
+    fill_rect(buf, pw, ph, 0, 0, SIDEBAR_W, 1, BEVEL_LT);
+    fill_rect(buf, pw, ph, 0, HEADER_H - 1, SIDEBAR_W, 1, BEVEL_DK);
+    let ty = HEADER_H.saturating_sub(r.cell_h) / 2;
+    draw_text(buf, pw, ph, r, 8, ty, SIDEBAR_W - 16, "WORKSPACE", INK);
+    // Hard divider between the pane and the terminal.
+    fill_rect(buf, pw, ph, SIDEBAR_W - 1, 0, 1, ph, BEVEL_DK);
 
-    let text_y = (TAB_BAR_H.saturating_sub(r.cell_h)) / 2;
-    for (i, tab) in tabs.iter().enumerate() {
-        let (x0, w) = State::tab_rect(i);
-        if x0 >= pw {
+    for (i, row) in rows.iter().enumerate() {
+        let y = HEADER_H + i * ROW_H;
+        if y + ROW_H > ph {
             break;
         }
-        let is_active = i == active;
-        let h = if is_active { TAB_BAR_H } else { TAB_BAR_H - 2 };
-        let (hi, lo) = if is_active {
-            (TAB_HI, TAB_LO)
+        let ind = row.depth * INDENT;
+        let is_sel = row.id == selected;
+        if is_sel {
+            vgradient(buf, pw, ph, 1, y, SIDEBAR_W - 2, ROW_H, PANEL_HI, PANEL_LO);
+            stroke_rect(buf, pw, ph, 1, y, SIDEBAR_W - 2, ROW_H, BEVEL_DK);
+            fill_rect(buf, pw, ph, 1, y, SIDEBAR_W - 2, 1, BEVEL_LT);
+        }
+        let gy = y + ty;
+        if row.is_group {
+            // Boxed expander, classic tree control.
+            let bx = 1 + ind;
+            stroke_rect(buf, pw, ph, bx, y + 4, EXPANDER_W - 4, ROW_H - 8, BEVEL_DK);
+            let mark = if row.expanded { "-" } else { "+" };
+            let glyph_ok = row.has_children;
+            draw_text(
+                buf,
+                pw,
+                ph,
+                r,
+                bx + 2,
+                gy,
+                EXPANDER_W,
+                if glyph_ok { mark } else { " " },
+                INK,
+            );
+            draw_text(
+                buf,
+                pw,
+                ph,
+                r,
+                1 + ind + EXPANDER_W + 2,
+                gy,
+                SIDEBAR_W.saturating_sub(ind + EXPANDER_W + 8),
+                &row.name,
+                INK,
+            );
         } else {
-            (TAB_INACT_HI, TAB_INACT_LO)
-        };
-        vgradient(buf, pw, ph, x0, 0, w, h, hi, lo);
-        // Bevel: light top/left, dark bottom/right (classic raised look).
-        stroke_rect(buf, pw, ph, x0, 0, w, h, BEVEL_DK);
-        fill_rect(buf, pw, ph, x0, 0, w, 1, BEVEL_LT);
-        fill_rect(buf, pw, ph, x0, 0, 1, h, BEVEL_LT);
-
-        let fg = if is_active { TAB_FG } else { TAB_FG_DIM };
-        draw_text(
-            buf,
-            pw,
-            ph,
-            r,
-            x0 + TAB_PAD_X,
-            text_y,
-            w.saturating_sub(TAB_PAD_X * 2),
-            &tab.title,
-            fg,
-        );
+            let live = sessions.contains_key(&row.id);
+            // Run-state marker: filled = running a command, hollow = idle.
+            let running = sessions
+                .get(&row.id)
+                .map(|s| observe(s.shell_pid).foreground)
+                .unwrap_or(false);
+            let (mark, mc) = if running {
+                ("\u{25a0}", RUN_INK) // ■
+            } else if live {
+                ("\u{25a1}", INK_DIM) // □
+            } else {
+                ("\u{00b7}", INK_DIM) // ·
+            };
+            draw_text(buf, pw, ph, r, 1 + ind + 4, gy, EXPANDER_W, mark, mc);
+            draw_text(
+                buf,
+                pw,
+                ph,
+                r,
+                1 + ind + EXPANDER_W + 4,
+                gy,
+                SIDEBAR_W.saturating_sub(ind + EXPANDER_W + 10),
+                &row.name,
+                if is_sel { INK } else { INK_DIM },
+            );
+        }
     }
 }
 
+/// A small bevelled Start/Stop popup at the cursor.
+fn draw_ctx_menu(buf: &mut [u32], pw: usize, ph: usize, r: &mut Renderer, x: usize, y: usize) {
+    let h = ROW_H * 2 + 2;
+    vgradient(buf, pw, ph, x, y, CTX_W, h, PANEL_HI, PANEL_LO);
+    stroke_rect(buf, pw, ph, x, y, CTX_W, h, BEVEL_DK);
+    fill_rect(buf, pw, ph, x, y, CTX_W, 1, BEVEL_LT);
+    fill_rect(buf, pw, ph, x, y, 1, h, BEVEL_LT);
+    let ty = ROW_H.saturating_sub(r.cell_h) / 2;
+    draw_text(buf, pw, ph, r, x + 10, y + 1 + ty, CTX_W, "Start", INK);
+    fill_rect(buf, pw, ph, x + 4, y + ROW_H, CTX_W - 8, 1, BEVEL_DK);
+    draw_text(buf, pw, ph, r, x + 10, y + ROW_H + 1 + ty, CTX_W, "Stop", INK);
+}
+
+/// Which context-menu item (if any) the point falls on. `0` = Start, `1` =
+/// Stop, `None` = outside the menu (dismiss).
+fn ctx_item_at(m: &CtxMenu, x: f64, y: f64) -> Option<usize> {
+    let (mx, my) = (m.x as f64, m.y as f64);
+    let h = (ROW_H * 2 + 2) as f64;
+    if x < mx || x >= mx + CTX_W as f64 || y < my || y >= my + h {
+        return None;
+    }
+    Some(if (y - my) < ROW_H as f64 { 0 } else { 1 })
+}
+
+// --- gamma-correct alpha blending (unchanged) ------------------------------
+
 /// sRGB(0..=255) -> linear-light(0..=1) lookup table. Blending glyph coverage
 /// in linear light (not raw sRGB) is what makes anti-aliased text crisp and
-/// correctly weighted instead of muddy — the single biggest text-quality win
-/// available with a CPU rasterizer.
+/// correctly weighted instead of muddy.
 fn srgb_lut() -> &'static [f32; 256] {
     static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
     LUT.get_or_init(|| {
@@ -767,6 +1351,12 @@ fn blend(fg: u32, bg: u32, a: u32) -> u32 {
     mix(16) << 16 | mix(8) << 8 | mix(0)
 }
 
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
@@ -777,47 +1367,62 @@ impl ApplicationHandler<UserEvent> for App {
                 .create_window(Window::default_attributes().with_title("termem"))
                 .expect("create window"),
         );
-
         let renderer = Renderer::new();
         let ctx = softbuffer::Context::new(window.clone()).unwrap();
         let surface = softbuffer::Surface::new(&ctx, window.clone()).unwrap();
 
+        let home = home_dir();
+        let ws_text = std::fs::read_to_string("workspace").unwrap_or_default();
+        let tree = parse_workspace(&ws_text, &home);
+
         let inner = window.inner_size();
-        let size = TermSize {
-            cols: (inner.width as usize / renderer.cell_w).max(1),
-            lines: (inner.height as usize).saturating_sub(TAB_BAR_H) / renderer.cell_h.max(1),
-        };
-        let size = TermSize {
-            lines: size.lines.max(1),
-            ..size
-        };
-
-        let first = spawn_tab(
-            &self.proxy,
-            0,
-            1,
-            size,
-            renderer.cell_w,
-            renderer.cell_h,
-        );
-
-        self.state = Some(State {
+        let mut st = State {
             window,
             surface,
             renderer,
-            tabs: vec![first],
-            active: 0,
-            next_id: 1,
-            next_label: 2,
+            selected: tree
+                .first_leaf(tree.root)
+                .unwrap_or(tree.root),
+            tree,
+            sessions: HashMap::new(),
+            id_of: HashMap::new(),
+            next_id: 0,
+            ctx: None,
             clipboard: arboard::Clipboard::new().ok(),
             mouse: (0.0, 0.0),
             selecting: false,
             last_click: None,
             mods: ModifiersState::empty(),
-        });
+        };
+        let size = st.grid_size(inner.width as usize, inner.height as usize);
+
+        // On open: an idle PTY per spec leaf — cwd set, no command run.
+        let leaves = st.tree.leaves(st.tree.root);
+        for node in leaves {
+            let (Some((workdir, _)), name) = (
+                st.tree.leaf_spec(node).map(|(w, c)| (w.to_path_buf(), c)),
+                st.tree.nodes[node].name.clone(),
+            ) else {
+                continue;
+            };
+            let id = st.next_id;
+            st.next_id += 1;
+            let (tab, pid) = spawn_session(
+                &self.proxy,
+                id,
+                name,
+                Some(workdir),
+                size,
+                st.renderer.cell_w,
+                st.renderer.cell_h,
+            );
+            st.id_of.insert(id, node);
+            st.sessions.insert(node, Session { tab, shell_pid: pid });
+        }
+        self.state = Some(st);
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Wakeup => {
                 if let Some(st) = &self.state {
@@ -825,28 +1430,43 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Exit(id) => {
-                let idx = self
-                    .state
-                    .as_ref()
-                    .and_then(|st| st.tabs.iter().position(|t| t.id == id));
-                if let Some(idx) = idx {
-                    if self.close_tab(idx) {
-                        event_loop.exit();
+                if let Some(st) = self.state.as_mut() {
+                    if let Some(&node) = st.id_of.get(&id) {
+                        if let Some(s) = st.sessions.remove(&node) {
+                            let _ = s.tab.pty_tx.send(Msg::Shutdown);
+                        }
+                        st.id_of.remove(&id);
+                        // A scratch tab disappears when its shell exits; a
+                        // spec leaf stays so Start can bring it back.
+                        if st.tree.nodes[node].dynamic {
+                            if let Some(p) = st.tree.nodes[node].parent {
+                                st.tree.nodes[p].children.retain(|&c| c != node);
+                                if st.selected == node {
+                                    st.selected = p;
+                                }
+                            }
+                        }
+                        st.window.request_redraw();
                     }
                 }
             }
             UserEvent::Title(id, title) => {
                 if let Some(st) = self.state.as_mut() {
-                    if let Some(t) = st.tabs.iter_mut().find(|t| t.id == id) {
-                        t.title = title;
+                    if let Some(&node) = st.id_of.get(&id) {
+                        if let Some(s) = st.sessions.get_mut(&node) {
+                            s.tab.title = title;
+                        }
                         st.window.request_redraw();
                     }
                 }
             }
             UserEvent::ResetTitle(id) => {
                 if let Some(st) = self.state.as_mut() {
-                    if let Some(t) = st.tabs.iter_mut().find(|t| t.id == id) {
-                        t.title = format!("Terminal {}", t.id + 1);
+                    if let Some(&node) = st.id_of.get(&id) {
+                        let name = st.tree.nodes[node].name.clone();
+                        if let Some(s) = st.sessions.get_mut(&node) {
+                            s.tab.title = name;
+                        }
                         st.window.request_redraw();
                     }
                 }
@@ -867,12 +1487,12 @@ impl ApplicationHandler<UserEvent> for App {
                         cell_width: st.renderer.cell_w as u16,
                         cell_height: st.renderer.cell_h as u16,
                     };
-                    // Every tab shares the window, so resize them all — not
-                    // just the focused one — to keep background sessions sane.
-                    for tab in &mut st.tabs {
-                        tab.size = size;
-                        tab.term.lock().resize(size);
-                        let _ = tab.pty_tx.send(Msg::Resize(ws));
+                    // Every session shares the window: resize them all so
+                    // background ones stay sane.
+                    for s in st.sessions.values_mut() {
+                        s.tab.size = size;
+                        s.tab.term.lock().resize(size);
+                        let _ = s.tab.pty_tx.send(Msg::Resize(ws));
                     }
                     st.window.request_redraw();
                 }
@@ -886,56 +1506,106 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(st) = self.state.as_mut() {
                     st.mouse = (position.x, position.y);
                     if st.selecting {
-                        let mut term = st.tabs[st.active].term.lock();
-                        let (point, side) = st.pixel_to_point(&term);
-                        if let Some(sel) = term.selection.as_mut() {
-                            sel.update(point, side);
+                        if let Some(node) = st.shown() {
+                            let size = st.sessions[&node].tab.size;
+                            let mut term = st.sessions[&node].tab.term.lock();
+                            let (point, side) = st.pixel_to_point(&term, size);
+                            if let Some(sel) = term.selection.as_mut() {
+                                sel.update(point, side);
+                            }
+                            drop(term);
+                            st.window.request_redraw();
                         }
-                        drop(term);
-                        st.window.request_redraw();
                     }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if let Some(st) = self.state.as_mut() {
-                    match (button, state) {
-                        (MouseButton::Left, ElementState::Pressed) => {
-                            // A click on the tab strip switches tabs; only
-                            // clicks in the terminal area start a selection.
-                            if let Some(i) = st.tab_at(st.mouse.0, st.mouse.1) {
-                                self.select_tab(i);
-                            } else if st.mouse.1 >= TAB_BAR_H as f64 {
-                                // A second click in the same spot within
-                                // 400ms is a double-click: select the word.
+                let Some(stref) = self.state.as_ref() else { return };
+                let (mx, my) = stref.mouse;
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        // 1. A click anywhere resolves an open context menu.
+                        if let Some(m) = &self.state.as_ref().unwrap().ctx {
+                            let pick = ctx_item_at(m, mx, my);
+                            let node = m.node;
+                            self.state.as_mut().unwrap().ctx = None;
+                            match pick {
+                                Some(0) => self.start(node),
+                                Some(1) => self.stop(node),
+                                _ => {}
+                            }
+                            if let Some(st) = &self.state {
+                                st.window.request_redraw();
+                            }
+                            return;
+                        }
+                        // 2. Sidebar: expander toggles fold, row selects.
+                        let rows = self.state.as_ref().unwrap().tree.rows();
+                        if let Some((node, on_exp)) =
+                            self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
+                        {
+                            let st = self.state.as_mut().unwrap();
+                            if on_exp {
+                                let e = &mut st.tree.nodes[node].expanded;
+                                *e = !*e;
+                            } else {
+                                st.selected = node;
+                            }
+                            st.window.request_redraw();
+                            return;
+                        }
+                        // 3. Terminal area: start a text selection.
+                        if mx >= SIDEBAR_W as f64 && my >= HEADER_H as f64 {
+                            if let Some(node) = self.state.as_ref().unwrap().shown() {
                                 let now = std::time::Instant::now();
+                                let st = self.state.as_mut().unwrap();
                                 let double = st.last_click.is_some_and(|(t, p)| {
                                     now.duration_since(t).as_millis() < 400
-                                        && (p.0 - st.mouse.0).abs() < 4.0
-                                        && (p.1 - st.mouse.1).abs() < 4.0
+                                        && (p.0 - mx).abs() < 4.0
+                                        && (p.1 - my).abs() < 4.0
                                 });
-                                st.last_click = Some((now, st.mouse));
+                                st.last_click = Some((now, (mx, my)));
                                 let ty = if double {
                                     SelectionType::Semantic
                                 } else {
                                     SelectionType::Simple
                                 };
-                                let mut term = st.tabs[st.active].term.lock();
-                                let (point, side) = st.pixel_to_point(&term);
+                                let size = st.sessions[&node].tab.size;
+                                let mut term = st.sessions[&node].tab.term.lock();
+                                let (point, side) = st.pixel_to_point(&term, size);
                                 term.selection = Some(Selection::new(ty, point, side));
                                 drop(term);
                                 st.selecting = true;
                                 st.window.request_redraw();
                             }
                         }
-                        (MouseButton::Left, ElementState::Released) => {
-                            st.selecting = false;
-                            self.copy_to_clipboard();
-                        }
-                        (MouseButton::Middle, ElementState::Pressed) => {
-                            self.paste();
-                        }
-                        _ => {}
                     }
+                    (MouseButton::Left, ElementState::Released) => {
+                        if let Some(st) = self.state.as_mut() {
+                            st.selecting = false;
+                        }
+                        self.copy_to_clipboard();
+                    }
+                    (MouseButton::Right, ElementState::Pressed) => {
+                        let rows = self.state.as_ref().unwrap().tree.rows();
+                        if let Some((node, _)) =
+                            self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
+                        {
+                            let st = self.state.as_mut().unwrap();
+                            st.selected = node;
+                            st.ctx = Some(CtxMenu {
+                                x: (mx as usize).min(SIDEBAR_W),
+                                y: my as usize,
+                                node,
+                            });
+                            st.window.request_redraw();
+                        } else if let Some(st) = self.state.as_mut() {
+                            st.ctx = None;
+                            st.window.request_redraw();
+                        }
+                    }
+                    (MouseButton::Middle, ElementState::Pressed) => self.paste(),
+                    _ => {}
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -943,13 +1613,6 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let kmods = self.state.as_ref().map(|s| s.mods).unwrap_or_default();
-                if kmods.control_key() {
-                    // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs (most-recent-style).
-                    if let Key::Named(NamedKey::Tab) = &event.logical_key {
-                        self.cycle_tab(if kmods.shift_key() { -1 } else { 1 });
-                        return;
-                    }
-                }
                 if kmods.control_key() && kmods.shift_key() {
                     match &event.logical_key {
                         Key::Character(c) if c.eq_ignore_ascii_case("c") => {
@@ -961,44 +1624,32 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         Key::Character(c) if c.eq_ignore_ascii_case("t") => {
-                            self.new_tab();
+                            self.new_scratch();
                             return;
                         }
                         Key::Character(c) if c.eq_ignore_ascii_case("w") => {
-                            let idx = self.state.as_ref().map(|s| s.active);
-                            if let Some(idx) = idx {
-                                if self.close_tab(idx) {
-                                    event_loop.exit();
-                                }
+                            self.close_selected();
+                            return;
+                        }
+                        Key::Character(c) if c.eq_ignore_ascii_case("s") => {
+                            if let Some(n) = self.state.as_ref().map(|s| s.selected) {
+                                self.start(n);
                             }
                             return;
                         }
-                        Key::Character(c) => {
-                            // Ctrl+Shift+<1..9> jumps straight to that tab.
-                            if let Some(d) = c.chars().next().and_then(|d| d.to_digit(10)) {
-                                if d >= 1 {
-                                    self.select_tab(d as usize - 1);
-                                    return;
-                                }
+                        Key::Character(c) if c.eq_ignore_ascii_case("x") => {
+                            if let Some(n) = self.state.as_ref().map(|s| s.selected) {
+                                self.stop(n);
                             }
-                        }
-                        Key::Named(NamedKey::PageUp) => {
-                            self.cycle_tab(-1);
-                            return;
-                        }
-                        Key::Named(NamedKey::PageDown) => {
-                            self.cycle_tab(1);
                             return;
                         }
                         _ => {}
                     }
                 }
-                let mods = self.state.as_ref().map(|s| s.mods).unwrap_or_default();
-                let (ctrl, alt, shift) =
-                    (mods.control_key(), mods.alt_key(), mods.shift_key());
+                let mods = kmods;
+                let (ctrl, alt, shift) = (mods.control_key(), mods.alt_key(), mods.shift_key());
                 // xterm modifier parameter: 1 + shift + 2*alt + 4*ctrl.
                 let m = 1 + shift as u8 + 2 * alt as u8 + 4 * ctrl as u8;
-                // CSI sequence for a cursor/edit key, with modifier encoding.
                 let csi = |tail: &str| -> Vec<u8> {
                     if m > 1 {
                         format!("\x1b[1;{m}{tail}").into_bytes()
@@ -1006,7 +1657,6 @@ impl ApplicationHandler<UserEvent> for App {
                         format!("\x1b[{tail}").into_bytes()
                     }
                 };
-                // Tilde-style keys (Home/End/Delete/Page): \x1b[N~ or \x1b[N;m~.
                 let tilde = |n: u8| -> Vec<u8> {
                     if m > 1 {
                         format!("\x1b[{n};{m}~").into_bytes()
@@ -1035,30 +1685,20 @@ impl ApplicationHandler<UserEvent> for App {
                     Key::Named(NamedKey::Space) => {
                         if ctrl { vec![0] } else { vec![b' '] }
                     }
-                    Key::Character(c) if ctrl => {
-                        // Ctrl+letter -> C0 control byte (ctrl-a = 0x01, …).
-                        // Covers ctrl-a/ctrl-e/ctrl-w/ctrl-u/ctrl-c, etc.
-                        match c.chars().next() {
-                            Some(ch) if ch.is_ascii() => {
-                                let b = (ch as u8).to_ascii_uppercase();
-                                let ctl = match b {
-                                    b'@'..=b'_' => b & 0x1f,
-                                    b' ' => 0,
-                                    b'?' => 0x7f,
-                                    _ => return,
-                                };
-                                if alt {
-                                    vec![0x1b, ctl]
-                                } else {
-                                    vec![ctl]
-                                }
-                            }
-                            _ => return,
+                    Key::Character(c) if ctrl => match c.chars().next() {
+                        Some(ch) if ch.is_ascii() => {
+                            let b = (ch as u8).to_ascii_uppercase();
+                            let ctl = match b {
+                                b'@'..=b'_' => b & 0x1f,
+                                b' ' => 0,
+                                b'?' => 0x7f,
+                                _ => return,
+                            };
+                            if alt { vec![0x1b, ctl] } else { vec![ctl] }
                         }
-                    }
+                        _ => return,
+                    },
                     _ => match event.text {
-                        // Alt+<char> is sent as ESC-prefixed (Meta) for
-                        // word-wise readline bindings like Alt+b / Alt+f.
                         Some(ref t) if alt => {
                             let mut v = vec![0x1b];
                             v.extend_from_slice(t.as_bytes());
@@ -1083,4 +1723,122 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let mut app = App { proxy, state: None };
     event_loop.run_app(&mut app).expect("run");
+}
+
+// ===========================================================================
+// tests — the functional core, exercised without a display
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree() -> Tree {
+        parse_workspace(include_str!("../workspace"), Path::new("/home/u"))
+    }
+
+    fn group(t: &Tree, name: &str) -> NodeId {
+        t.nodes
+            .iter()
+            .position(|n| n.name == name && matches!(n.kind, Kind::Group))
+            .unwrap()
+    }
+
+    #[test]
+    fn parses_groups_leaves_and_synthetic_areas() {
+        let t = tree();
+        // Root child groups, in file order, then the two synthetic ones.
+        let groups: Vec<&str> = t.nodes[t.root]
+            .children
+            .iter()
+            .map(|&c| t.nodes[c].name.as_str())
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                "Apps",
+                "Music",
+                "Diabetes",
+                "Morphology",
+                "HTGAA",
+                "Study",
+                "Scratch",
+                "Transient",
+            ]
+        );
+        // Scratch / Transient are empty groups (homes for ad-hoc tabs).
+        assert!(t.leaves(group(&t, "Scratch")).is_empty());
+        assert!(t.leaves(group(&t, "Transient")).is_empty());
+    }
+
+    #[test]
+    fn leaf_spec_expands_tilde_and_keeps_command() {
+        let t = tree();
+        let music = group(&t, "Music");
+        let leaves = t.leaves(music);
+        assert_eq!(leaves.len(), 2);
+        let (wd, cmd) = t.leaf_spec(leaves[0]).unwrap();
+        assert_eq!(t.nodes[leaves[0]].name, "Hermes chat");
+        assert_eq!(wd, Path::new("/home/u/Music")); // ~ expanded
+        assert_eq!(cmd, "hermes");
+        // Quoted multi-word command survives intact.
+        assert_eq!(t.leaf_spec(leaves[1]).unwrap().1, "nano wanted");
+    }
+
+    #[test]
+    fn group_for_new_resolves_context() {
+        let t = tree();
+        let music = group(&t, "Music");
+        let leaf = t.leaves(music)[0];
+        assert_eq!(t.group_for_new(leaf), music); // leaf -> its group
+        assert_eq!(t.group_for_new(music), music); // group -> itself
+    }
+
+    #[test]
+    fn already_running_predicate() {
+        let idle = Obs::default();
+        let busy = Obs {
+            foreground: true,
+            cmd: Some("/usr/bin/hermes --serve".into()),
+        };
+        assert!(!already_running(&idle, "hermes")); // no foreground job
+        assert!(!already_running(&busy, "")); // a bare shell is never "running"
+        assert!(already_running(&busy, "hermes")); // program matches
+        assert!(already_running(&Obs { foreground: true, cmd: Some("bun run main.ts".into()) }, "bun run main.ts"));
+        assert!(!already_running(&busy, "./run.sh")); // different program
+    }
+
+    #[test]
+    fn plan_start_is_idempotent() {
+        let t = tree();
+        let music = group(&t, "Music");
+        let [a, b] = t.leaves(music)[..] else { panic!() };
+
+        // Nothing spawned yet: each leaf gets Spawn then Run.
+        let none = |_: NodeId| false;
+        let acts = plan_start(&t, &none, &HashMap::new(), music);
+        assert_eq!(acts.len(), 4);
+        assert!(matches!(acts[0], Action::Spawn(x) if x == a));
+        assert!(matches!(acts[1], Action::Run(x) if x == a));
+
+        // Sessions exist; `a` is already running its command -> skip it
+        // entirely, only `b` is (re)run.
+        let all = |_: NodeId| true;
+        let mut obs = HashMap::new();
+        obs.insert(a, Obs { foreground: true, cmd: Some("hermes".into()) });
+        let acts = plan_start(&t, &all, &obs, music);
+        assert_eq!(acts.len(), 1);
+        assert!(matches!(acts[0], Action::Run(x) if x == b));
+    }
+
+    #[test]
+    fn plan_stop_targets_only_live_leaves() {
+        let t = tree();
+        let music = group(&t, "Music");
+        let [a, _b] = t.leaves(music)[..] else { panic!() };
+        let only_a = move |n: NodeId| n == a;
+        let acts = plan_stop(&t, &only_a, music);
+        assert_eq!(acts.len(), 1);
+        assert!(matches!(acts[0], Action::Sigint(x) if x == a));
+    }
 }
