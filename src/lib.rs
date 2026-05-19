@@ -1225,6 +1225,9 @@ struct App {
     /// The window's pixel surface. Lives here (not on `State`) so the
     /// headless harness can own a `State` with no surface at all.
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    /// Where the workspace tree is loaded from and persisted to (CLI arg, or
+    /// the default `~/.termspace/workspace01`).
+    ws_path: PathBuf,
 }
 
 impl App {
@@ -1460,7 +1463,7 @@ impl App {
     fn save_workspace(&self) {
         if let Some(st) = &self.state {
             let text = serialize_workspace(&st.tree, &home_dir());
-            let _ = std::fs::write("workspace", text);
+            let _ = std::fs::write(&self.ws_path, text);
         }
     }
 
@@ -2124,6 +2127,33 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Which workspace file to use: the first CLI argument if given (a leading
+/// `~` is expanded), else the default `~/.termspace/workspace01`. A
+/// missing/blank argument falls back to the default. If the file doesn't
+/// exist the app just opens a blank workspace and creates it on first save.
+fn resolve_workspace_path() -> PathBuf {
+    match std::env::args().nth(1) {
+        Some(a) if !a.trim().is_empty() => expand_tilde(a.trim(), &home_dir()),
+        _ => home_dir().join(".termspace").join("workspace01"),
+    }
+}
+
+/// The tree a brand-new (missing/empty) workspace opens with: a `Project`
+/// group holding one session in the current working directory, plus the
+/// usual Scratch/Transient areas (appended by `parse_workspace`). Nothing is
+/// written to disk — this only lives in memory until the first save.
+fn default_workspace_text() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let name = cwd
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
+    format!(
+        "workspaces\n\tProject\n\t\t\"{name}\"\t{}\n",
+        cwd.display()
+    )
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
@@ -2152,7 +2182,10 @@ impl ApplicationHandler<UserEvent> for App {
         self.surface = Some(softbuffer::Surface::new(&ctx, window.clone()).unwrap());
 
         let home = home_dir();
-        let ws_text = std::fs::read_to_string("workspace").unwrap_or_default();
+        let mut ws_text = std::fs::read_to_string(&self.ws_path).unwrap_or_default();
+        if ws_text.trim().is_empty() {
+            ws_text = default_workspace_text();
+        }
         let tree = parse_workspace(&ws_text, &home);
 
         let inner = window.inner_size();
@@ -2597,10 +2630,12 @@ pub fn run() {
         .expect("build event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    let ws_path = resolve_workspace_path();
     let mut app = App {
         proxy,
         state: None,
         surface: None,
+        ws_path,
     };
     event_loop.run_app(&mut app).expect("run");
 }
@@ -2884,5 +2919,27 @@ mod tests {
         assert_eq!(reloaded.nodes[leaves[0]].name, "Scratch 1");
         assert_eq!(wd, Path::new("/home/u/work"));
         assert_eq!(cmd, "");
+    }
+
+    #[test]
+    fn new_workspace_has_project_session_in_cwd_plus_scratch() {
+        // A brand-new (missing/empty) workspace opens with a `Project` group
+        // holding one session whose workdir is the current directory, plus
+        // the Scratch/Transient areas.
+        let t = parse_workspace(&default_workspace_text(), Path::new("/home/u"));
+        let is_group = |name| {
+            t.nodes
+                .iter()
+                .any(|n| n.name == name && matches!(n.kind, Kind::Group))
+        };
+        assert!(is_group("Project"));
+        assert!(is_group("Scratch") && is_group("Transient"));
+
+        let project = group(&t, "Project");
+        let leaves = t.leaves(project);
+        assert_eq!(leaves.len(), 1, "one starter session");
+        let (wd, cmd) = t.leaf_spec(leaves[0]).unwrap();
+        assert_eq!(wd, std::env::current_dir().unwrap());
+        assert_eq!(cmd, "", "just a shell, no default command");
     }
 }
