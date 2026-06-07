@@ -35,3 +35,15 @@ workspaces
 		"logs"	~/app	tail -f log/dev.log
 		"claude"	~/app	claude
 ```
+
+## Shortcuts.
+
+Special key is assumed as macOS (Cmd), Linux (Ctrl+Shift)
+
+ - **New tab**. Ctrl+Shift+T
+ - **Close Tab**. Ctrl+Shift+W
+ - **Navigate up/down tab**. Ctrl+Shift+Up/Down
+ - **Edit layout**. Ctrl+Shift+,
+ - **Save current layout**. Ctrl+Shift+S
+ - **Quit**. Ctrl+Shift+Q
+
