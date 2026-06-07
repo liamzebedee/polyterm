@@ -36,7 +36,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{ResizeDirection, Window, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 pub mod testkit;
 
@@ -749,6 +749,9 @@ enum UserEvent {
     Exit(u64),
     Title(u64, String),
     ResetTitle(u64),
+    /// Glyph-coverage fonts (emoji + OS CJK/symbol faces) finished loading on a
+    /// worker thread — swap them into the renderer so later frames cover more.
+    FallbackFonts(Vec<fontdue::Font>),
 }
 
 /// `EventListener` impl handed to `alacritty_terminal`. Forwards the events we
@@ -876,20 +879,13 @@ impl Renderer {
             load(UBUNTU_MONO_ITALIC),
             load(UBUNTU_MONO_BOLD_ITALIC),
         ];
-        // Embedded Noto Emoji (monochrome) leads the fallback chain so emoji
-        // render the same on every OS; OS faces follow for anything else the
-        // primary family lacks (CJK, rare symbols).
-        let mut fallbacks: Vec<fontdue::Font> = Vec::new();
-        if let Ok(f) = fontdue::Font::from_bytes(NOTO_EMOJI.to_vec(), fontdue::FontSettings::default())
-        {
-            fallbacks.push(f);
-        }
-        fallbacks.extend(
-            fallback_font_paths()
-                .iter()
-                .filter_map(|p| std::fs::read(p).ok())
-                .filter_map(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok()),
-        );
+        // The fallback chain (embedded emoji + OS faces for CJK/rare symbols) is
+        // *not* loaded here: parsing those fonts — and the `fc-match` subprocesses
+        // that locate the OS ones — cost ~100ms+ and would block the window from
+        // appearing at all. They're only ever consulted lazily by `glyph()` for a
+        // char the primary family lacks, so `load_fallback_fonts()` runs on a
+        // worker thread and the result is swapped in via `UserEvent::FallbackFonts`.
+        let fallbacks: Vec<fontdue::Font> = Vec::new();
 
         let lm = styles[0]
             .horizontal_line_metrics(FONT_PX)
@@ -972,6 +968,24 @@ const NOTO_EMOJI: &[u8] = include_bytes!("../assets/fonts/NotoEmoji-Regular.ttf"
 
 /// OS-specific fallback font paths for glyph coverage beyond the primary face.
 /// Pure list of candidate paths; non-existent ones are skipped by `load_fonts`.
+/// Build the lazy fallback chain: embedded Noto Emoji (monochrome) first so
+/// emoji render identically on every OS, then OS faces (`fallback_font_paths`)
+/// for anything the primary family lacks (CJK, rare symbols). Runs off the
+/// critical path on a worker thread — see `Renderer::new`.
+fn load_fallback_fonts() -> Vec<fontdue::Font> {
+    let mut fallbacks: Vec<fontdue::Font> = Vec::new();
+    if let Ok(f) = fontdue::Font::from_bytes(NOTO_EMOJI.to_vec(), fontdue::FontSettings::default()) {
+        fallbacks.push(f);
+    }
+    fallbacks.extend(
+        fallback_font_paths()
+            .iter()
+            .filter_map(|p| std::fs::read(p).ok())
+            .filter_map(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok()),
+    );
+    fallbacks
+}
+
 fn fallback_font_paths() -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
@@ -1032,7 +1046,9 @@ const SIDEBAR_W: usize = 212; // fixed-width tree pane
 const HEADER_H: usize = 24; // title bar over the terminal & sidebar head
 const ROW_H: usize = 20; // one tree row
 const INDENT: usize = 14; // px added per tree depth
-const EXPANDER_W: usize = 14; // hit width of a group's [+]/[-] box
+const EXPANDER_W: usize = 14; // width of the expander / leaf-marker column
+const TPAD: usize = 7; // left gutter inside the tree, so rows clear the pane edge
+const MARK_GAP: usize = 5; // gap between the marker column and the row label
 const CTX_W: usize = 124; // context-menu width
 const RPANEL_W: usize = 252; // right inspector pane width
 const WBTN_W: usize = 30; // min/max/close button width
@@ -1352,6 +1368,10 @@ struct State {
     /// Sub-line wheel remainder, so a high-resolution touchpad's many small
     /// deltas accumulate into whole-line scrolls instead of being dropped.
     scroll_acc: f64,
+    /// Cursor icon currently set on the window, so `set_cursor` is only called
+    /// when the shape actually changes (e.g. entering/leaving a resize grip)
+    /// rather than on every mouse-move event.
+    cursor: CursorIcon,
 }
 
 impl State {
@@ -1599,15 +1619,15 @@ impl State {
     /// Hit-test a point against the sidebar tree. Returns the row's node id and
     /// whether the hit landed on a group's expander box.
     fn sidebar_hit(&self, x: f64, y: f64, rows: &[Row]) -> Option<(NodeId, bool)> {
-        let top = HEADER_H + INFO_H; // header band + info-toggle band
+        let top = HEADER_H + INFO_H + 1; // header band + info-toggle band + divider
         if x >= SIDEBAR_W as f64 || y < top as f64 {
             return None;
         }
         let i = (y as usize - top) / ROW_H;
         let row = rows.get(i)?;
-        let ind = row.depth * INDENT;
+        let mark_x = TPAD + row.depth * INDENT;
         let on_expander =
-            row.is_group && (x as usize) >= ind && (x as usize) < ind + EXPANDER_W;
+            row.is_group && (x as usize) >= mark_x && (x as usize) < mark_x + EXPANDER_W;
         Some((row.id, on_expander))
     }
 }
@@ -1621,6 +1641,9 @@ struct App {
     /// Where the workspace tree is loaded from and persisted to (CLI arg, or
     /// the default `~/.termspace/workspace01`).
     ws_path: PathBuf,
+    /// The window is created hidden and revealed once, after the first frame
+    /// is presented, so no blank surface flashes on open.
+    revealed: bool,
 }
 
 impl App {
@@ -2005,9 +2028,24 @@ impl App {
         } else {
             return;
         };
-        let App { state, surface, .. } = self;
+        let App { state, surface, revealed, .. } = self;
         let (Some(st), Some(surface)) = (state.as_mut(), surface.as_mut()) else {
             return;
+        };
+        // Map the window the first time a frame is about to reach the screen —
+        // *before* `present()`, not after. An X11 window has no backing store,
+        // so presenting while it's still hidden is discarded, and mapping an
+        // un-painted window flashes whatever is behind it. Mapping first, then
+        // presenting in the same synchronous block, makes the server process
+        // Map→PutImage in order so the compositor's first composite already
+        // holds our pixels — no flash, no see-through frame.
+        let reveal = |st: &State, revealed: &mut bool| {
+            if !*revealed {
+                if let Some(w) = &st.window {
+                    w.set_visible(true);
+                }
+                *revealed = true;
+            }
         };
         let (pw, ph) = st.phys;
         let (Some(w), Some(h)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) else {
@@ -2019,6 +2057,7 @@ impl App {
         if !scaled {
             // Non-HiDPI: the logical frame already is the physical frame.
             buf.copy_from_slice(&st.fb);
+            reveal(st, revealed);
             buf.present().unwrap();
             return;
         }
@@ -2039,6 +2078,7 @@ impl App {
         if let Some(cmds) = st.renderer.text_log.take() {
             render_text_cmds(&mut buf[..], pw, ph, &mut st.renderer, cmds, sx, sy);
         }
+        reveal(st, revealed);
         buf.present().unwrap();
     }
 
@@ -2355,29 +2395,49 @@ fn draw_sidebar(
     fill_rect(buf, pw, ph, 0, 0, SIDEBAR_W, 1, BEVEL_LT);
     fill_rect(buf, pw, ph, 0, HEADER_H - 1, SIDEBAR_W, 1, BEVEL_DK);
     // (No "WORKSPACE" header label — intentionally hidden.)
-    let ty = HEADER_H.saturating_sub(r.cell_h) / 2;
+    // Text sits centred within a *row*, not the taller header band, so glyphs
+    // never ride low against the row below.
+    let ty = ROW_H.saturating_sub(r.cell_h) / 2;
     // Hard divider between the pane and the terminal.
     fill_rect(buf, pw, ph, SIDEBAR_W - 1, 0, 1, ph, BEVEL_DK);
-    // Latched info icon directly below the WORKSPACE head.
+    // Latched info icon directly below the WORKSPACE head, on its own toolbar
+    // band: a subtle gradient + bottom divider sets the "toolbar" off from the
+    // list so the icon doesn't float in empty space.
+    vgradient(buf, pw, ph, 0, HEADER_H, SIDEBAR_W, INFO_H, HEAD_HI, HEAD_LO);
+    fill_rect(buf, pw, ph, 0, HEADER_H + INFO_H - 1, SIDEBAR_W, 1, BEVEL_DK);
+    fill_rect(buf, pw, ph, 0, HEADER_H + INFO_H, SIDEBAR_W, 1, BEVEL_LT);
     draw_info_icon(buf, pw, ph, info_btn(), inspector);
 
     for (i, row) in rows.iter().enumerate() {
-        let y = HEADER_H + INFO_H + i * ROW_H;
+        let y = HEADER_H + INFO_H + 1 + i * ROW_H;
         if y + ROW_H > ph {
             break;
         }
         let ind = row.depth * INDENT;
+        // One column grid shared by groups and leaves: a fixed left gutter, the
+        // marker column, a gap, then the label — so every label at a given
+        // depth lines up regardless of node kind.
+        let mark_x = TPAD + ind;
+        let text_x = mark_x + EXPANDER_W + MARK_GAP;
+        let text_w = SIDEBAR_W.saturating_sub(text_x + TPAD);
         let is_sel = row.id == selected;
         if is_sel {
+            // A flat raised bar (top highlight + bottom shadow) with a coloured
+            // accent down the left edge — reads as a selected list row, not a
+            // detached button.
             vgradient(buf, pw, ph, 1, y, SIDEBAR_W - 2, ROW_H, PANEL_HI, PANEL_LO);
-            stroke_rect(buf, pw, ph, 1, y, SIDEBAR_W - 2, ROW_H, BEVEL_DK);
             fill_rect(buf, pw, ph, 1, y, SIDEBAR_W - 2, 1, BEVEL_LT);
+            fill_rect(buf, pw, ph, 1, y + ROW_H - 1, SIDEBAR_W - 2, 1, BEVEL_DK);
+            fill_rect(buf, pw, ph, 1, y, 3, ROW_H, SEL);
         }
         let gy = y + ty;
         if row.is_group {
-            // Boxed expander, classic tree control.
-            let bx = 1 + ind;
-            stroke_rect(buf, pw, ph, bx, y + 4, EXPANDER_W - 4, ROW_H - 8, BEVEL_DK);
+            // Boxed expander, classic tree control — a tidy square centred in
+            // the marker column.
+            let bw = EXPANDER_W - 4;
+            let bx = mark_x + (EXPANDER_W - bw) / 2;
+            let by = y + (ROW_H - bw) / 2;
+            stroke_rect(buf, pw, ph, bx, by, bw, bw, BEVEL_DK);
             let mark = if row.expanded { "-" } else { "+" };
             let glyph_ok = row.has_children;
             draw_text(
@@ -2385,46 +2445,40 @@ fn draw_sidebar(
                 pw,
                 ph,
                 r,
-                bx + 2,
+                bx + 1,
                 gy,
                 EXPANDER_W,
                 if glyph_ok { mark } else { " " },
                 INK,
             );
-            draw_text(
-                buf,
-                pw,
-                ph,
-                r,
-                1 + ind + EXPANDER_W + 2,
-                gy,
-                SIDEBAR_W.saturating_sub(ind + EXPANDER_W + 8),
-                &row.name,
-                INK,
-            );
+            draw_text(buf, pw, ph, r, text_x, gy, text_w, &row.name, INK);
         } else {
             let live = sessions.contains_key(&row.id);
-            // Run-state marker: filled = running a command, hollow = idle.
             let running = sessions
                 .get(&row.id)
                 .map(|s| observe(s.shell_pid).foreground)
                 .unwrap_or(false);
-            let (mark, mc) = if running {
-                ("\u{25a0}", RUN_INK) // ■
+            // Run-state marker drawn (not a font glyph) so it stays a crisp,
+            // fixed size and centres in the same column as the expander box:
+            // filled square = running, hollow square = live/idle, small dot =
+            // not live.
+            let cx = mark_x + EXPANDER_W / 2;
+            let cy = y + ROW_H / 2;
+            if running {
+                fill_rect(buf, pw, ph, cx - 3, cy - 3, 7, 7, RUN_INK);
             } else if live {
-                ("\u{25a1}", INK_DIM) // □
+                stroke_rect(buf, pw, ph, cx - 4, cy - 4, 8, 8, INK_DIM);
             } else {
-                ("\u{00b7}", INK_DIM) // ·
-            };
-            draw_text(buf, pw, ph, r, 1 + ind + 4, gy, EXPANDER_W, mark, mc);
+                fill_rect(buf, pw, ph, cx - 1, cy - 1, 3, 3, INK_DIM);
+            }
             draw_text(
                 buf,
                 pw,
                 ph,
                 r,
-                1 + ind + EXPANDER_W + 4,
+                text_x,
                 gy,
-                SIDEBAR_W.saturating_sub(ind + EXPANDER_W + 10),
+                text_w,
                 &row.name,
                 if is_sel { INK } else { INK_DIM },
             );
@@ -2646,7 +2700,7 @@ fn win_btns(pw: usize) -> [Rect; 3] {
 /// directly below the WORKSPACE head. Filled = the inspector pane is shown.
 fn info_btn() -> Rect {
     let s = INFO_H - 8; // square side
-    (6, HEADER_H + (INFO_H - s) / 2, s, s)
+    (TPAD, HEADER_H + (INFO_H - s) / 2, s, s)
 }
 
 /// `[title, command, directory]` boxes inside the inspector pane, in
@@ -2692,6 +2746,21 @@ fn resize_dir(pw: usize, ph: usize, x: f64, y: f64) -> Option<ResizeDirection> {
         (_, _, _, true) => ResizeDirection::East,
         _ => return None,
     })
+}
+
+/// The OS cursor that signals each resize direction, so the pointer turns into
+/// the matching double-headed arrow when it enters a window edge or corner.
+fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
+    match dir {
+        ResizeDirection::North => CursorIcon::NResize,
+        ResizeDirection::South => CursorIcon::SResize,
+        ResizeDirection::East => CursorIcon::EResize,
+        ResizeDirection::West => CursorIcon::WResize,
+        ResizeDirection::NorthEast => CursorIcon::NeResize,
+        ResizeDirection::NorthWest => CursorIcon::NwResize,
+        ResizeDirection::SouthEast => CursorIcon::SeResize,
+        ResizeDirection::SouthWest => CursorIcon::SwResize,
+    }
 }
 
 // --- gamma-correct alpha blending (unchanged) ------------------------------
@@ -2771,6 +2840,62 @@ fn default_workspace_text() -> String {
     )
 }
 
+/// Tell X11/the compositor the window is fully opaque and clear its backing to
+/// black, before it's mapped. Without this, a freshly-mapped compositor-redirected
+/// window has an undefined (often see-through) pixmap for the frame or two before
+/// our first `present()` lands — which shows as a flash of the desktop behind it.
+/// Best-effort: any failure (Wayland, no X server, refused request) just falls
+/// through to the previous behaviour.
+#[cfg(target_os = "linux")]
+fn mark_window_opaque(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{
+        AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, PropMode,
+    };
+    // `change_property32` lives on a separate helper trait.
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let xid = match window.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Xlib(h)) => h.window as u32,
+        Ok(RawWindowHandle::Xcb(h)) => h.window.get(),
+        // Wayland (or anything else): no see-through-on-map problem to solve.
+        _ => return,
+    };
+    let Ok((conn, _screen)) = x11rb::connect(None) else {
+        return;
+    };
+    // New/exposed regions clear to black instead of leaving stale/transparent
+    // pixels for the compositor to show.
+    let _ = conn.change_window_attributes(
+        xid,
+        &ChangeWindowAttributesAux::new().background_pixel(0),
+    );
+    // `_NET_WM_OPAQUE_REGION = whole window` → the compositor won't alpha-blend
+    // the surface against the desktop, even before we've drawn into it.
+    if let Ok(reply) = conn
+        .intern_atom(false, b"_NET_WM_OPAQUE_REGION")
+        .map_err(drop)
+        .and_then(|c| c.reply().map_err(drop))
+    {
+        // Oversized on purpose — the compositor clips the region to the actual
+        // window, so this stays correct even if the WM resizes us after map
+        // (the pre-map `inner_size()` can't be trusted for that).
+        let region = [0u32, 0, 1 << 15, 1 << 15];
+        let _ = conn.change_property32(
+            PropMode::REPLACE,
+            xid,
+            reply.atom,
+            AtomEnum::CARDINAL,
+            &region,
+        );
+    }
+    // Round-trip so the server has applied all of the above before winit maps
+    // the window on its own (separate) connection.
+    let _ = conn.flush();
+    let _ = conn.get_input_focus().map(|c| c.reply());
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
@@ -2780,9 +2905,13 @@ impl ApplicationHandler<UserEvent> for App {
         // strip of screen.
         // `mut` is only used by the Linux WM-class block below.
         #[allow(unused_mut)]
+        // Start hidden so the compositor never shows the empty/garbage surface
+        // before our first frame lands; `redraw` reveals it after the first
+        // `present()`.
         let mut attrs = Window::default_attributes()
             .with_title("termem")
-            .with_decorations(false);
+            .with_decorations(false)
+            .with_visible(false);
         // Pin a stable WM class / Wayland app_id so the desktop entry's
         // `StartupWMClass=termem` binds the launcher icon to this window
         // (see scripts/install-icon.sh).
@@ -2796,7 +2925,20 @@ impl ApplicationHandler<UserEvent> for App {
         let window = Rc::new(
             event_loop.create_window(attrs).expect("create window"),
         );
+        // Mark the X11 window opaque + black-backed *before* it maps, so the
+        // compositor's first composite of it is a flat dark frame rather than a
+        // see-through hole onto the desktop while our pixels are still in flight.
+        #[cfg(target_os = "linux")]
+        mark_window_opaque(&window);
         let renderer = Renderer::new();
+        // Load the glyph-coverage fallback fonts off the critical path; they
+        // arrive back as `UserEvent::FallbackFonts` once parsed.
+        {
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let _ = proxy.send_event(UserEvent::FallbackFonts(load_fallback_fonts()));
+            });
+        }
         let ctx = softbuffer::Context::new(window.clone()).unwrap();
         self.surface = Some(softbuffer::Surface::new(&ctx, window.clone()).unwrap());
 
@@ -2808,7 +2950,7 @@ impl ApplicationHandler<UserEvent> for App {
         let tree = parse_workspace(&ws_text, &home);
 
         let inner = window.inner_size();
-        let mut st = State {
+        let st = State {
             phys: (inner.width as usize, inner.height as usize),
             scale: window.scale_factor().max(1.0),
             window: Some(window),
@@ -2831,7 +2973,27 @@ impl ApplicationHandler<UserEvent> for App {
             focus: None,
             caret: 0,
             scroll_acc: 0.0,
+            cursor: CursorIcon::Default,
         };
+        self.state = Some(st);
+
+        // Paint and reveal the window *before* spawning any shells: the chrome
+        // (sidebar tree, header, backdrop) is fully determined by the parsed
+        // workspace, so there's nothing to wait for. Forking a PTY per leaf
+        // costs ~100ms and produces no visible content anyway — a terminal only
+        // shows what its shell writes, which streams in asynchronously — so it
+        // has no business being on the path to first paint.
+        //
+        // Twice on purpose: the first call maps the window (`set_visible`) then
+        // presents; the second guarantees a present lands *after* the map even
+        // though winit (map) and softbuffer (present) drive separate X11
+        // connections whose request order isn't otherwise synchronised. Cheap
+        // (one extra chrome paint at startup) insurance against a see-through
+        // first frame.
+        self.redraw();
+        self.redraw();
+
+        let st = self.state.as_mut().unwrap();
         let (lw, lh) = st.logical_size();
         let size = st.grid_size(lw, lh);
 
@@ -2858,7 +3020,7 @@ impl ApplicationHandler<UserEvent> for App {
             st.id_of.insert(id, node);
             st.sessions.insert(node, Session { tab, shell_pid: pid });
         }
-        self.state = Some(st);
+        st.request_redraw();
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -2918,6 +3080,16 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            UserEvent::FallbackFonts(fonts) => {
+                if let Some(st) = self.state.as_mut() {
+                    st.renderer.fallbacks = fonts;
+                    // Glyphs rendered before the fallbacks arrived were cached
+                    // using the primary face (tofu for chars it lacks); drop the
+                    // cache so they re-rasterize with full coverage.
+                    st.renderer.cache.clear();
+                    st.request_redraw();
+                }
+            }
         }
     }
 
@@ -2925,7 +3097,14 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Resized(_) => self.relayout(),
+            // Repaint *synchronously* on every size change. During a resize the
+            // OS runs its own modal loop, so a queued `request_redraw` isn't
+            // serviced until the drag ends — leaving a frozen, stretched frame.
+            // Drawing here makes the content track the window edge live instead.
+            WindowEvent::Resized(_) => {
+                self.relayout();
+                self.redraw();
+            }
             // Moving between displays of different density (or an OS zoom
             // change) must reflow: `relayout` re-reads size *and* scale off
             // the window, keeping the logical layout constant.
@@ -2941,6 +3120,20 @@ impl ApplicationHandler<UserEvent> for App {
                     // space, so divide by the scale before hit-testing.
                     let s = st.scale.max(1.0);
                     st.mouse = (position.x / s, position.y / s);
+                    // Show a resize cursor over the window's edge/corner grips
+                    // so the resize affordance is discoverable; fall back to the
+                    // default arrow everywhere else. Only push to the OS when the
+                    // shape changes to avoid a `set_cursor` per mouse-move.
+                    let (pw, ph) = st.logical_size();
+                    let want = resize_dir(pw, ph, st.mouse.0, st.mouse.1)
+                        .map(resize_cursor)
+                        .unwrap_or(CursorIcon::Default);
+                    if want != st.cursor {
+                        st.cursor = want;
+                        if let Some(w) = &st.window {
+                            w.set_cursor(want);
+                        }
+                    }
                     if st.selecting {
                         if let Some(node) = st.shown() {
                             let size = st.sessions[&node].tab.size;
@@ -3258,6 +3451,12 @@ impl ApplicationHandler<UserEvent> for App {
 /// binary (`src/main.rs`) is a thin shim over this so the rest of the crate
 /// stays a library the integration harness (`testkit`) can drive headlessly.
 pub fn run() {
+    // Warm the backdrop decode off-thread so its one-time ~15ms cost overlaps
+    // event-loop + font setup instead of landing on the first paint. `backdrop()`
+    // caches into a `OnceLock`, so the first `paint()` just reads the result.
+    std::thread::spawn(|| {
+        let _ = backdrop();
+    });
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("build event loop");
@@ -3269,6 +3468,7 @@ pub fn run() {
         state: None,
         surface: None,
         ws_path,
+        revealed: false,
     };
     event_loop.run_app(&mut app).expect("run");
 }

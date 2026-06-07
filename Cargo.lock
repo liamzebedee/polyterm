@@ -1713,8 +1713,10 @@ dependencies = [
  "arboard",
  "fontdue",
  "image",
+ "raw-window-handle",
  "softbuffer",
  "winit",
+ "x11rb",
 ]
 
 [[package]]

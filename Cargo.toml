@@ -10,3 +10,10 @@ fontdue = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 softbuffer = "0.4"
 winit = "0.30"
+
+# Linux-only: mark the window opaque + black-backed before it maps, so the
+# compositor never shows a see-through (desktop-behind) frame on open. Versions
+# match what winit/softbuffer already pull in transitively.
+[target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle = "0.6"
+x11rb = "0.13"
