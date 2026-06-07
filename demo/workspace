@@ -2,11 +2,15 @@ workspaces
 	Frontend
 		"web"	~/app/web	npm run dev
 		"storybook"	~/app/web	npm run storybook
+		"claude"	~/app/web	claude
 	Backend
 		"api"	~/app/api	cargo watch -x run
 		"worker"	~/app/api	cargo run --bin worker
+		"claude"	~/app/api	claude
 	Infra
 		"postgres"	~/app	docker compose up db
 		"redis"	~/app	redis-server
+		"claude"	~/app	claude
 	Tools
 		"logs"	~/app	tail -f log/dev.log
+		"claude"	~/app	claude

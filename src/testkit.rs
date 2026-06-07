@@ -50,7 +50,6 @@ impl Harness {
         let state = State {
             window: None,
             fb: Vec::new(),
-            content_fb: Vec::new(),
             phys: (w, h),
             scale,
             renderer: Renderer::new(),

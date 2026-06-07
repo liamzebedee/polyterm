@@ -1043,16 +1043,7 @@ const SEL: u32 = 0x2f_5d_6e; // selection fill (white text stays readable)
 // right margin (see `State::sidebar_w`). It is never narrower than the header
 // info button. A toggle (⌘B / Ctrl+Shift+B) hides it entirely (width 0).
 const SIDEBAR_MARGIN: usize = 16; // fixed gap right of the longest label
-
-// The whole UI is laid out within a "content rect" inset by `WIN_MARGIN` on
-// every side and rounded at the corners with `WIN_RADIUS`. Everything outside
-// it (the margin band and the corner cut-outs) is the flat `MAT` colour, so the
-// app reads as a rounded panel floating on a dark mat. softbuffer presents RGB
-// only (no per-pixel alpha), so this is done in the framebuffer rather than by
-// shaping a transparent window.
-const WIN_MARGIN: usize = 8; // inset of the content panel from the window edge
-const WIN_RADIUS: f32 = 8.0; // corner radius of the content panel
-const MAT: u32 = 0x00_00_00; // the dark frame the rounded UI sits on
+const SIDEBAR_PAD_L: usize = 6; // small left inset before each tree label
 const HEADER_H: usize = 16; // title bar; one content row tall (= cell_h at FONT_PX) for uniform heights
 const ROW_H: usize = 20; // context-menu item height
 const CTX_W: usize = 124; // context-menu width
@@ -1351,9 +1342,6 @@ struct State {
     /// came out half-size on a 2× display) and screenshots are
     /// DPI-independent.
     fb: Vec<u32>,
-    /// Scratch buffer the UI is composed into at content size, then framed into
-    /// `fb` with the rounded mat. Reused across frames to avoid per-frame allocs.
-    content_fb: Vec<u32>,
     /// Physical pixel size of the window (or the harness's virtual target).
     phys: (usize, usize),
     /// Device pixel ratio (winit `scale_factor`). 1.0 headless / non-HiDPI.
@@ -1407,17 +1395,6 @@ impl State {
         )
     }
 
-    /// Logical size of the content panel: the window minus the `WIN_MARGIN`
-    /// mat on every side. All chrome geometry and hit-testing live in this
-    /// content space (origin at `(WIN_MARGIN, WIN_MARGIN)` within the window).
-    fn content_size(&self) -> (usize, usize) {
-        let (w, h) = self.logical_size();
-        (
-            w.saturating_sub(2 * WIN_MARGIN),
-            h.saturating_sub(2 * WIN_MARGIN),
-        )
-    }
-
     /// Pull current physical size + scale off the window (no-op headless).
     fn sync_metrics(&mut self) {
         if let Some(w) = &self.window {
@@ -1438,22 +1415,14 @@ impl State {
     /// Compose the whole UI into `self.fb` at logical (device-independent)
     /// size. No window or surface involved — the GUI path upscales `fb` onto
     /// the real surface afterwards; the test harness reads `fb` straight off.
-    ///
-    /// The UI is composed at *content* size into `content_fb`, then framed into
-    /// `fb` (full window size) inset by `WIN_MARGIN` with rounded corners over
-    /// the `MAT`. Working in content space keeps every chrome rect, gradient and
-    /// hit-test oblivious to the margin — only this function and the input
-    /// translation know about it.
     fn paint(&mut self) {
-        // `pw`/`ph` are the *content* dimensions throughout this function, so
-        // all the draw code below lays out at origin (0,0) within the panel.
-        let (pw, ph) = self.content_size();
-        // `shown()` borrows all of `State`; resolve it before we take a buffer.
+        let (pw, ph) = self.logical_size();
+        // `shown()` borrows all of `State`; resolve it before we take `fb`.
         let shown = self.shown();
-        // Reuse the content buffer's allocation across frames; taking it out
+        // Reuse the framebuffer's allocation across frames; taking it out
         // detaches it from `self` so the draw code can freely borrow other
         // fields (renderer glyph cache, sessions, tree) at the same time.
-        let mut buf = std::mem::take(&mut self.content_fb);
+        let mut buf = std::mem::take(&mut self.fb);
         buf.clear();
         buf.resize(pw * ph, BG);
 
@@ -1574,14 +1543,7 @@ impl State {
             draw_ctx_menu(&mut buf, pw, ph, &mut self.renderer, m.x, m.y);
         }
 
-        // --- frame the panel onto the rounded mat ---------------------------
-        let (fw, fh) = self.logical_size();
-        let mut fb = std::mem::take(&mut self.fb);
-        fb.clear();
-        fb.resize(fw * fh, MAT);
-        composite_rounded(&mut fb, fw, fh, &buf, pw, ph, WIN_MARGIN, WIN_RADIUS);
-        self.fb = fb;
-        self.content_fb = buf;
+        self.fb = buf;
     }
 
     /// Re-render just the terminal grid at full device resolution, directly onto
@@ -1599,16 +1561,9 @@ impl State {
         let Some(node) = self.shown() else { return };
         let sx = pw as f64 / lw as f64;
         let sy = ph as f64 / lh as f64;
-        // The terminal lives in content space, offset by the margin mat; all
-        // physical origins fold the margin in before scaling to device pixels.
-        let m = WIN_MARGIN as f64;
-        let content_w = lw.saturating_sub(2 * WIN_MARGIN);
-        let origin_x = ((m + self.sidebar_w() as f64) * sx).round() as usize;
-        let origin_y = ((m + HEADER_H as f64) * sy).round() as usize;
-        let clip_right =
-            ((m + term_right(content_w, self.inspector) as f64) * sx).round() as usize;
-        // Bottom of the content panel (the mat resumes below it).
-        let bottom = ((lh as f64 - m) * sy).round() as usize;
+        let origin_x = (self.sidebar_w() as f64 * sx).round() as usize;
+        let origin_y = (HEADER_H as f64 * sy).round() as usize;
+        let clip_right = (term_right(lw, self.inspector) as f64 * sx).round() as usize;
         let cell_w = ((self.renderer.cell_w as f64 * sx).round() as usize).max(1);
         let cell_h = ((self.renderer.cell_h as f64 * sy).round() as usize).max(1);
         let font_px = FONT_PX * sy as f32;
@@ -1623,7 +1578,7 @@ impl State {
             origin_x,
             origin_y,
             clip_right.saturating_sub(origin_x),
-            bottom.saturating_sub(origin_y),
+            ph.saturating_sub(origin_y),
         );
         let term = self.sessions[&node].tab.term.lock();
         draw_terminal_cells(
@@ -1673,16 +1628,13 @@ impl State {
         label_px.max(WBTN_W) + SIDEBAR_MARGIN
     }
 
-    /// Grid size for the terminal area (window minus the margin mat, sidebar,
-    /// header and — when open — the right inspector pane).
+    /// Grid size for the terminal area (window minus sidebar, header and —
+    /// when open — the right inspector pane).
     fn grid_size(&self, win_w: usize, win_h: usize) -> TermSize {
-        // Work in content space: drop the margin mat from both axes first.
-        let cw = win_w.saturating_sub(2 * WIN_MARGIN);
-        let chh = win_h.saturating_sub(2 * WIN_MARGIN);
-        let avail = term_right(cw, self.inspector).saturating_sub(self.sidebar_w());
+        let avail = term_right(win_w, self.inspector).saturating_sub(self.sidebar_w());
         TermSize {
             cols: (avail / self.renderer.cell_w).max(1),
-            lines: (chh.saturating_sub(HEADER_H) / self.renderer.cell_h).max(1),
+            lines: (win_h.saturating_sub(HEADER_H) / self.renderer.cell_h).max(1),
         }
     }
 
@@ -1691,9 +1643,8 @@ impl State {
     fn pixel_to_point(&self, term: &Term<Listener>, size: TermSize) -> (Point, Side) {
         let cw = self.renderer.cell_w as f64;
         let ch = self.renderer.cell_h as f64;
-        let m = WIN_MARGIN as f64;
-        let mx = (self.mouse.0 - m - self.sidebar_w() as f64).max(0.0);
-        let my = (self.mouse.1 - m - HEADER_H as f64).max(0.0);
+        let mx = (self.mouse.0 - self.sidebar_w() as f64).max(0.0);
+        let my = (self.mouse.1 - HEADER_H as f64).max(0.0);
         let col = ((mx / cw) as usize).min(size.cols.saturating_sub(1));
         let row = ((my / ch) as usize).min(size.lines.saturating_sub(1));
         let offset = term.grid().display_offset() as i32;
@@ -2045,7 +1996,7 @@ impl App {
             st.focus = None;
             return;
         };
-        let fr = field_rects(st.content_size().0, st.renderer.cell_h)[f.index()];
+        let fr = field_rects(st.logical_size().0, st.renderer.cell_h)[f.index()];
         let rel = (click_x - (fr.0 + 5) as f64).max(0.0);
         let idx = (rel / st.renderer.cell_w as f64).round() as usize;
         st.focus = Some(f);
@@ -2182,8 +2133,7 @@ impl App {
         st.overdraw_terminal_physical(&mut buf[..], pw, ph);
         let (sx, sy) = (pw as f64 / lw as f64, ph as f64 / lh as f64);
         if let Some(cmds) = st.renderer.text_log.take() {
-            let m = WIN_MARGIN as f64;
-            render_text_cmds(&mut buf[..], pw, ph, &mut st.renderer, cmds, sx, sy, m, m);
+            render_text_cmds(&mut buf[..], pw, ph, &mut st.renderer, cmds, sx, sy);
         }
         reveal(st, revealed);
         buf.present().unwrap();
@@ -2276,58 +2226,6 @@ fn fill_circle(buf: &mut [u32], pw: usize, ph: usize, cx: f32, cy: f32, r: f32, 
             }
             let idx = yy * pw + xx;
             buf[idx] = blend(color, buf[idx], (cov * 255.0 + 0.5) as u32);
-        }
-    }
-}
-
-/// Copy the `cw`×`ch` content panel `src` into the `fw`×`fh` window framebuffer
-/// `dst` at offset `(margin, margin)`, masked to a rounded rectangle of corner
-/// radius `radius`. `dst` is assumed pre-filled with the mat colour; the corners
-/// are anti-aliased (the content blends into the mat over a 1px boundary) so the
-/// rounding reads smoothly even at logical resolution. Pixels well inside the
-/// panel are a straight copy — the signed-distance maths only bites near the
-/// four corners.
-fn composite_rounded(
-    dst: &mut [u32],
-    fw: usize,
-    fh: usize,
-    src: &[u32],
-    cw: usize,
-    ch: usize,
-    margin: usize,
-    radius: f32,
-) {
-    // Half-extents and centre of the content rect, for the rounded-box SDF.
-    let (hx, hy) = (cw as f32 / 2.0, ch as f32 / 2.0);
-    let r = radius.min(hx).min(hy);
-    for cy in 0..ch {
-        let dy = margin + cy;
-        if dy >= fh {
-            break;
-        }
-        for cx in 0..cw {
-            let dx = margin + cx;
-            if dx >= fw {
-                break;
-            }
-            let s = src[cy * cw + cx];
-            let di = dy * fw + dx;
-            // Signed distance to the rounded-rect boundary (negative inside).
-            // Only the corner quadrants ever leave the interior, so the common
-            // case is `qx,qy <= 0` -> dist far negative -> a plain copy.
-            let qx = (cx as f32 + 0.5 - hx).abs() - (hx - r);
-            let qy = (cy as f32 + 0.5 - hy).abs() - (hy - r);
-            if qx <= 0.0 || qy <= 0.0 {
-                dst[di] = s; // straight edge / interior: fully covered
-                continue;
-            }
-            let dist = (qx * qx + qy * qy).sqrt() - r;
-            let cov = (0.5 - dist).clamp(0.0, 1.0);
-            dst[di] = if cov >= 1.0 {
-                s
-            } else {
-                blend(s, dst[di], (cov * 255.0 + 0.5) as u32)
-            };
         }
     }
 }
@@ -2460,14 +2358,12 @@ fn draw_text(
 /// logical command is re-laid at `(sx, sy)` with glyphs rasterized at
 /// `FONT_PX × sy`, so chrome text comes out as crisp as the terminal grid on a
 /// Retina display (rather than being nearest-neighbour-doubled and chunky).
-fn render_text_cmds(buf: &mut [u32], bw: usize, bh: usize, r: &mut Renderer, cmds: Vec<TextCmd>, sx: f64, sy: f64, ox: f64, oy: f64) {
+fn render_text_cmds(buf: &mut [u32], bw: usize, bh: usize, r: &mut Renderer, cmds: Vec<TextCmd>, sx: f64, sy: f64) {
     let font_px = FONT_PX * sy as f32;
     let cell_w = ((r.cell_w as f64 * sx).round() as usize).max(1);
     for cmd in cmds {
-        // Commands are captured in content space; shift by the margin origin
-        // `(ox, oy)` (logical) before scaling onto the physical surface.
-        let x0 = ((cmd.x as f64 + ox) * sx).round() as usize;
-        let y0 = ((cmd.y as f64 + oy) * sy).round() as usize;
+        let x0 = (cmd.x as f64 * sx).round() as usize;
+        let y0 = (cmd.y as f64 * sy).round() as usize;
         let max_w = (cmd.max_w as f64 * sx).round() as usize;
         let mut pen = x0;
         for c in cmd.text.chars() {
@@ -3139,7 +3035,6 @@ impl ApplicationHandler<UserEvent> for App {
             scale: window.scale_factor().max(1.0),
             window: Some(window),
             fb: Vec::new(),
-            content_fb: Vec::new(),
             renderer,
             selected: tree
                 .first_leaf(tree.root)
@@ -3311,8 +3206,6 @@ impl ApplicationHandler<UserEvent> for App {
                     // so the resize affordance is discoverable; fall back to the
                     // default arrow everywhere else. Only push to the OS when the
                     // shape changes to avoid a `set_cursor` per mouse-move.
-                    // Resize grips live on the real window edge (outside the
-                    // mat), so they hit-test in absolute window space.
                     let (pw, ph) = st.logical_size();
                     let want = resize_dir(pw, ph, st.mouse.0, st.mouse.1)
                         .map(resize_cursor)
@@ -3323,15 +3216,11 @@ impl ApplicationHandler<UserEvent> for App {
                             w.set_cursor(want);
                         }
                     }
-                    // Chrome hit-tests are in content space (window minus mat).
-                    let m = WIN_MARGIN as f64;
-                    let (cw, _ch) = st.content_size();
-                    let (cmx, cmy) = (st.mouse.0 - m, st.mouse.1 - m);
                     // Traffic-light hover: reveal the dots' glyphs while the
                     // pointer is over any of them. Repaint only on a change.
-                    let hover = win_btns(cw)
+                    let hover = win_btns(pw)
                         .iter()
-                        .position(|&r| hit(r, cmx, cmy));
+                        .position(|&r| hit(r, st.mouse.0, st.mouse.1));
                     if hover != st.win_hover {
                         st.win_hover = hover;
                         st.request_redraw();
@@ -3352,17 +3241,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let Some(stref) = self.state.as_ref() else { return };
-                // Raw window-space pointer (for the resize grips on the real
-                // edge) and the content-space pointer (for all chrome, which is
-                // laid out inside the margin mat).
-                let (rmx, rmy) = stref.mouse;
-                let m = WIN_MARGIN as f64;
-                let (mx, my) = (rmx - m, rmy - m);
+                let (mx, my) = stref.mouse;
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => {
-                        // Content width for chrome; full dims for the edge grips.
-                        let (pw, _) = self.state.as_ref().unwrap().content_size();
-                        let (fw, fh) = self.state.as_ref().unwrap().logical_size();
+                        let (pw, ph) = self.state.as_ref().unwrap().logical_size();
 
                         // 1. A click anywhere resolves an open context menu.
                         if let Some(m) = &self.state.as_ref().unwrap().ctx {
