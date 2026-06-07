@@ -55,6 +55,14 @@ fn ui_walkthrough() {
     // 4. A group selected (fans out / shows first session under it).
     h.inspector(false).select("Diabetes");
     h.screenshot("group-selected");
+
+    // 5. Hovering a window-control traffic light reveals all three glyphs.
+    h.hover_win(Some(2));
+    h.screenshot("win-hover");
+
+    // 6. Sidebar toggled off (⌘B / Ctrl+Shift+B): terminal takes the full width.
+    h.hover_win(None).select("Diabetes/Sugar tracker").sidebar(false);
+    h.screenshot("sidebar-hidden");
 }
 
 /// The macOS fix: the UI is laid out in logical pixels, so a 2× Retina

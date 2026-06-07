@@ -156,23 +156,22 @@ impl Tree {
     /// is the catamorphism the sidebar render and hit-testing both fold over,
     /// so the picture on screen and the click map can never disagree.
     fn rows(&self) -> Vec<Row> {
-        fn go(t: &Tree, id: NodeId, depth: usize, out: &mut Vec<Row>) {
+        fn go(t: &Tree, id: NodeId, out: &mut Vec<Row>) {
             for &c in &t.nodes[id].children {
                 let n = &t.nodes[c];
                 let is_group = matches!(n.kind, Kind::Group);
                 out.push(Row {
                     id: c,
-                    depth,
                     name: n.name.clone(),
                     is_group,
                 });
                 if is_group && n.expanded {
-                    go(t, c, depth + 1, out);
+                    go(t, c, out);
                 }
             }
         }
         let mut out = Vec::new();
-        go(self, self.root, 0, &mut out);
+        go(self, self.root, &mut out);
         out
     }
 
@@ -239,7 +238,6 @@ impl Tree {
 /// A flattened, render-ready view of one visible tree node.
 struct Row {
     id: NodeId,
-    depth: usize,
     name: String,
     is_group: bool,
 }
@@ -526,6 +524,7 @@ enum Shortcut {
     Expand,
     Start,
     Stop,
+    ToggleSidebar,
 }
 
 /// Map a modified keystroke to a [`Shortcut`], or `None` to pass it through to
@@ -533,14 +532,14 @@ enum Shortcut {
 ///
 /// * **macOS** uses ⌘ (Command), like every native mac app: ⌘C copy, ⌘V paste,
 ///   ⌘T new tab, ⌘W close, ⌘↑/⌘↓ select previous/next tree node, ⌘←/⌘→
-///   collapse/expand the selected group, ⌘R run/start, ⌘. stop. ⌘ never
-///   collides with the shell's own Ctrl- control codes, so all of these are
-///   safe to claim.
+///   collapse/expand the selected group, ⌘R run/start, ⌘. stop, ⌘B toggle the
+///   sidebar. ⌘ never collides with the shell's own Ctrl- control codes, so all
+///   of these are safe to claim.
 /// * **Elsewhere** there is no ⌘, so the terminal convention Ctrl+Shift is used
 ///   (plain Ctrl+C etc. must stay free for the shell): Ctrl+Shift+C/V/T/W for
 ///   copy/paste/new/close, Ctrl+Shift+↑/↓ select previous/next node,
-///   Ctrl+Shift+←/→ collapse/expand the selected group, Ctrl+Shift+S start,
-///   Ctrl+Shift+X stop.
+///   Ctrl+Shift+←/→ collapse/expand the selected group, Ctrl+Shift+B toggle the
+///   sidebar, Ctrl+Shift+S start, Ctrl+Shift+X stop.
 fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
     let ch = |name: &str| matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(name));
     #[cfg(target_os = "macos")]
@@ -560,6 +559,7 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
             Key::Named(NamedKey::ArrowDown) => Shortcut::SelectNext,
             Key::Named(NamedKey::ArrowLeft) => Shortcut::Collapse,
             Key::Named(NamedKey::ArrowRight) => Shortcut::Expand,
+            _ if ch("b") => Shortcut::ToggleSidebar,
             _ if ch("r") => Shortcut::Start,
             _ => return None,
         })
@@ -578,6 +578,7 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
             Key::Named(NamedKey::ArrowDown) => Shortcut::SelectNext,
             Key::Named(NamedKey::ArrowLeft) => Shortcut::Collapse,
             Key::Named(NamedKey::ArrowRight) => Shortcut::Expand,
+            _ if ch("b") => Shortcut::ToggleSidebar,
             _ if ch("s") => Shortcut::Start,
             _ if ch("x") => Shortcut::Stop,
             _ => return None,
@@ -1038,13 +1039,23 @@ const SEL: u32 = 0x2f_5d_6e; // selection fill (white text stays readable)
 // Windows 2000 design *principles* (not its colours): explicit borders and
 // bevels, a subtle vertical gradient, compact fixed heights, dense layout,
 // left-aligned titles.
-const SIDEBAR_W: usize = 212; // fixed-width tree pane
+// The sidebar auto-sizes to its content: the longest label plus this fixed
+// right margin (see `State::sidebar_w`). It is never narrower than the header
+// info button. A toggle (⌘B / Ctrl+Shift+B) hides it entirely (width 0).
+const SIDEBAR_MARGIN: usize = 16; // fixed gap right of the longest label
 const HEADER_H: usize = 16; // title bar; one content row tall (= cell_h at FONT_PX) for uniform heights
 const ROW_H: usize = 20; // context-menu item height
 const CTX_W: usize = 124; // context-menu width
 const RPANEL_W: usize = 252; // right inspector pane width
-const WBTN_W: usize = 30; // min/max/close button width
+const WBTN_W: usize = 30; // info-button width (the latched "i" on the left)
+const TLIGHT_CELL: usize = 18; // per-dot hit cell for the window controls
+const TLIGHT_R: f32 = 5.0; // traffic-light dot radius (px); diameter 10 in a 16px row
 const EDGE: f64 = 5.0; // borderless-window resize-grip thickness
+
+// macOS-style "traffic light" window controls (bitmap dots, not glyphs).
+const TLIGHT_MIN: u32 = 0xfe_bc_2e; // minimize — amber
+const TLIGHT_MAX: u32 = 0x28_c8_40; // maximize / restore — green
+const TLIGHT_CLOSE: u32 = 0xff_5f_57; // close — red
 
 // Black chrome with white text. The Win2k bevel structure is kept but recolored
 // to dark grays so panels read as raised/inset without any light surfaces.
@@ -1350,6 +1361,9 @@ struct State {
     mods: ModifiersState,
     /// Right inspector pane shown.
     inspector: bool,
+    /// Left sidebar tree pane shown. Toggled with ⌘B / Ctrl+Shift+B; hidden
+    /// gives the terminal the full width (the sidebar's width becomes 0).
+    sidebar_visible: bool,
     /// Inspector field currently captured by the keyboard (`None` = the PTY
     /// gets keystrokes as usual).
     focus: Option<Field>,
@@ -1362,6 +1376,10 @@ struct State {
     /// when the shape actually changes (e.g. entering/leaving a resize grip)
     /// rather than on every mouse-move event.
     cursor: CursorIcon,
+    /// Which window-control "traffic light" the mouse is currently over
+    /// (`0`=minimize, `1`=maximize, `2`=close), or `None`. Drives the hover
+    /// state that reveals the dots' glyphs, like macOS.
+    win_hover: Option<usize>,
 }
 
 impl State {
@@ -1411,6 +1429,8 @@ impl State {
         let ch = self.renderer.cell_h;
         // Right edge of the terminal: the inspector pane (if open) eats into it.
         let tr = term_right(pw, self.inspector);
+        // Left edge of the terminal: the sidebar (auto-sized; 0 when hidden).
+        let sw = self.sidebar_w();
 
         // --- terminal area --------------------------------------------------
         // Lay the backdrop image behind the grid; cells without their own
@@ -1419,9 +1439,9 @@ impl State {
             &mut buf,
             pw,
             ph,
-            SIDEBAR_W,
+            sw,
             HEADER_H,
-            tr.saturating_sub(SIDEBAR_W),
+            tr.saturating_sub(sw),
             ph.saturating_sub(HEADER_H),
         );
         if let Some(node) = shown {
@@ -1437,7 +1457,7 @@ impl State {
                 &mut self.renderer,
                 &term,
                 lines,
-                SIDEBAR_W,
+                sw,
                 HEADER_H,
                 tr,
                 cw,
@@ -1451,9 +1471,9 @@ impl State {
                 pw,
                 ph,
                 &mut self.renderer,
-                SIDEBAR_W + 10,
+                sw + 10,
                 HEADER_H + 10,
-                tr.saturating_sub(SIDEBAR_W + 20),
+                tr.saturating_sub(sw + 20),
                 NO_SESSION_HINT,
                 INK_DIM,
             );
@@ -1461,34 +1481,45 @@ impl State {
 
         // --- header bar over the terminal ----------------------------------
         // (No title text — the path/status label is intentionally hidden.)
-        vgradient(&mut buf, pw, ph, SIDEBAR_W, 0, pw - SIDEBAR_W, HEADER_H, HEAD_HI, HEAD_LO);
-        fill_rect(&mut buf, pw, ph, SIDEBAR_W, HEADER_H - 1, pw - SIDEBAR_W, 1, BEVEL_DK);
-        fill_rect(&mut buf, pw, ph, SIDEBAR_W, 0, pw - SIDEBAR_W, 1, BEVEL_LT);
-        let maxed = self.window.as_ref().is_some_and(|w| w.is_maximized());
+        vgradient(&mut buf, pw, ph, sw, 0, pw - sw, HEADER_H, HEAD_HI, HEAD_LO);
+        fill_rect(&mut buf, pw, ph, sw, HEADER_H - 1, pw - sw, 1, BEVEL_DK);
+        fill_rect(&mut buf, pw, ph, sw, 0, pw - sw, 1, BEVEL_LT);
         let [bmin, bmax, bclose] = win_btns(pw);
 
-        // Window controls, right-aligned in the header row. Plain ASCII glyphs
-        // from the primary mono face, so all controls share one font and size.
-        for (rect, label) in [
-            (bmin, "_"),                       // minimize (a bar at the bottom)
-            (bmax, if maxed { "][" } else { "[]" }), // maximize / restore
-            (bclose, "x"),                     // close
+        // Window controls: macOS-style "traffic light" dots, drawn as bitmap
+        // circles centred (both axes) in their hit cells — no glyphs, no bevels.
+        // Amber = minimize, green = maximize/restore, red = close. Hovering any
+        // dot lights the whole cluster and reveals each one's glyph (−, +, ×).
+        let hovering = self.win_hover.is_some();
+        for (rect, color, glyph) in [
+            (bmin, TLIGHT_MIN, TlGlyph::Minus),
+            (bmax, TLIGHT_MAX, TlGlyph::Plus),
+            (bclose, TLIGHT_CLOSE, TlGlyph::Cross),
         ] {
-            draw_button(&mut buf, pw, ph, &mut self.renderer, rect, label, false, true);
+            let (bx, by, bw, bh) = rect;
+            let cx = bx as f32 + bw as f32 / 2.0;
+            let cy = by as f32 + bh as f32 / 2.0;
+            fill_circle(&mut buf, pw, ph, cx, cy, TLIGHT_R, color);
+            if hovering {
+                draw_tlight_glyph(&mut buf, pw, ph, cx, cy, TLIGHT_R, glyph);
+            }
         }
 
         // --- sidebar tree ---------------------------------------------------
         let rows = self.tree.rows();
         let sel = self.selected;
-        draw_sidebar(
-            &mut buf,
-            pw,
-            ph,
-            &mut self.renderer,
-            &rows,
-            sel,
-            self.inspector,
-        );
+        if sw > 0 {
+            draw_sidebar(
+                &mut buf,
+                pw,
+                ph,
+                &mut self.renderer,
+                &rows,
+                sel,
+                self.inspector,
+                sw,
+            );
+        }
 
         // --- right inspector ------------------------------------------------
         if self.inspector {
@@ -1529,7 +1560,7 @@ impl State {
         let Some(node) = self.shown() else { return };
         let sx = pw as f64 / lw as f64;
         let sy = ph as f64 / lh as f64;
-        let origin_x = (SIDEBAR_W as f64 * sx).round() as usize;
+        let origin_x = (self.sidebar_w() as f64 * sx).round() as usize;
         let origin_y = (HEADER_H as f64 * sy).round() as usize;
         let clip_right = (term_right(lw, self.inspector) as f64 * sx).round() as usize;
         let cell_w = ((self.renderer.cell_w as f64 * sx).round() as usize).max(1);
@@ -1577,10 +1608,29 @@ impl State {
             .find(|l| self.sessions.contains_key(l))
     }
 
+    /// Logical width of the sidebar pane: `0` when hidden, otherwise the
+    /// longest label plus a fixed right margin (never narrower than the header
+    /// info button). All chrome geometry and hit-testing derive from this, so
+    /// the pane grows and shrinks to fit its content and vanishes when toggled
+    /// off.
+    fn sidebar_w(&self) -> usize {
+        if !self.sidebar_visible {
+            return 0;
+        }
+        let label_px = self
+            .tree
+            .rows()
+            .iter()
+            .map(|row| row.name.chars().count() * self.renderer.cell_w)
+            .max()
+            .unwrap_or(0);
+        label_px.max(WBTN_W) + SIDEBAR_MARGIN
+    }
+
     /// Grid size for the terminal area (window minus sidebar, header and —
     /// when open — the right inspector pane).
     fn grid_size(&self, win_w: usize, win_h: usize) -> TermSize {
-        let avail = term_right(win_w, self.inspector).saturating_sub(SIDEBAR_W);
+        let avail = term_right(win_w, self.inspector).saturating_sub(self.sidebar_w());
         TermSize {
             cols: (avail / self.renderer.cell_w).max(1),
             lines: (win_h.saturating_sub(HEADER_H) / self.renderer.cell_h).max(1),
@@ -1592,7 +1642,7 @@ impl State {
     fn pixel_to_point(&self, term: &Term<Listener>, size: TermSize) -> (Point, Side) {
         let cw = self.renderer.cell_w as f64;
         let ch = self.renderer.cell_h as f64;
-        let mx = (self.mouse.0 - SIDEBAR_W as f64).max(0.0);
+        let mx = (self.mouse.0 - self.sidebar_w() as f64).max(0.0);
         let my = (self.mouse.1 - HEADER_H as f64).max(0.0);
         let col = ((mx / cw) as usize).min(size.cols.saturating_sub(1));
         let row = ((my / ch) as usize).min(size.lines.saturating_sub(1));
@@ -1612,10 +1662,18 @@ impl State {
     /// `draw_sidebar`.
     fn sidebar_hit(&self, x: f64, y: f64, rows: &[Row]) -> Option<(NodeId, bool)> {
         let rh = self.renderer.cell_h;
-        if x >= SIDEBAR_W as f64 || y < HEADER_H as f64 {
+        let sw = self.sidebar_w();
+        if sw == 0 || x >= sw as f64 || y < HEADER_H as f64 {
             return None;
         }
-        let i = (y as usize - HEADER_H) / rh;
+        let off = y as usize - HEADER_H;
+        let tops = sidebar_row_tops(rows, rh);
+        // Last row whose top is at or above the click; reject clicks that land in
+        // a blank spacer between group blocks.
+        let i = tops.iter().rposition(|&t| off >= t)?;
+        if off >= tops[i] + rh {
+            return None;
+        }
         let row = rows.get(i)?;
         Some((row.id, row.is_group))
     }
@@ -1895,6 +1953,15 @@ impl App {
         self.relayout();
     }
 
+    /// Toggle the left sidebar pane (and reflow the terminal into the
+    /// freed/used space). Hiding it gives the terminal the full window width.
+    fn toggle_sidebar(&mut self) {
+        if let Some(st) = self.state.as_mut() {
+            st.sidebar_visible = !st.sidebar_visible;
+        }
+        self.relayout();
+    }
+
     /// Persist the tree to the `workspace` file so new sessions, renamed
     /// titles and edited commands survive a restart. Best-effort: a write
     /// failure is non-fatal.
@@ -2138,6 +2205,86 @@ fn vgradient(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize
     }
 }
 
+/// A filled, anti-aliased disc centred at (`cx`,`cy`) with radius `r`, blended
+/// over whatever is already in `buf`. A 1px-soft edge keeps the small chrome
+/// dots from looking jagged at logical resolution.
+fn fill_circle(buf: &mut [u32], pw: usize, ph: usize, cx: f32, cy: f32, r: f32, color: u32) {
+    let x0 = (cx - r - 1.0).floor().max(0.0) as usize;
+    let y0 = (cy - r - 1.0).floor().max(0.0) as usize;
+    let x1 = ((cx + r + 1.0).ceil().max(0.0) as usize).min(pw);
+    let y1 = ((cy + r + 1.0).ceil().max(0.0) as usize).min(ph);
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let dx = xx as f32 + 0.5 - cx;
+            let dy = yy as f32 + 0.5 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            // Full coverage inside, fading linearly to 0 over the outer 1px.
+            let cov = (r + 0.5 - d).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let idx = yy * pw + xx;
+            buf[idx] = blend(color, buf[idx], (cov * 255.0 + 0.5) as u32);
+        }
+    }
+}
+
+/// The dark symbol revealed inside a traffic-light dot on hover.
+#[derive(Clone, Copy)]
+enum TlGlyph {
+    Minus, // minimize
+    Plus,  // maximize / restore
+    Cross, // close
+}
+
+/// Distance from point (`px`,`py`) to the segment (`ax`,`ay`)–(`bx`,`by`).
+fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (cx, cy) = (ax + t * dx, ay + t * dy);
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
+}
+
+/// Stamp the dark macOS-style glyph inside a traffic-light dot centred at
+/// (`cx`,`cy`) with radius `r`. Strokes are anti-aliased line segments blended
+/// over the dot, so the symbol reads as an inset cut-out.
+fn draw_tlight_glyph(buf: &mut [u32], pw: usize, ph: usize, cx: f32, cy: f32, r: f32, g: TlGlyph) {
+    let e = r * 0.5; // arm half-length
+    let segs: &[(f32, f32, f32, f32)] = match g {
+        TlGlyph::Minus => &[(-1.0, 0.0, 1.0, 0.0)],
+        TlGlyph::Plus => &[(-1.0, 0.0, 1.0, 0.0), (0.0, -1.0, 0.0, 1.0)],
+        TlGlyph::Cross => &[(-1.0, -1.0, 1.0, 1.0), (-1.0, 1.0, 1.0, -1.0)],
+    };
+    let half = 0.7; // stroke half-width (px)
+    let x0 = (cx - r).floor().max(0.0) as usize;
+    let y0 = (cy - r).floor().max(0.0) as usize;
+    let x1 = ((cx + r).ceil().max(0.0) as usize + 1).min(pw);
+    let y1 = ((cy + r).ceil().max(0.0) as usize + 1).min(ph);
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let (fx, fy) = (xx as f32 + 0.5, yy as f32 + 0.5);
+            let d = segs
+                .iter()
+                .map(|&(ax, ay, bx, by)| {
+                    seg_dist(fx, fy, cx + ax * e, cy + ay * e, cx + bx * e, cy + by * e)
+                })
+                .fold(f32::MAX, f32::min);
+            let cov = (half + 0.5 - d).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let idx = yy * pw + xx;
+            // Dark, semi-opaque cut-out (a darkened tint of the dot beneath).
+            buf[idx] = blend(0x00_00_00, buf[idx], (cov * 200.0 + 0.5) as u32);
+        }
+    }
+}
+
 /// 1px rectangle outline.
 fn stroke_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
     if w == 0 || h == 0 {
@@ -2376,15 +2523,16 @@ fn draw_sidebar(
     rows: &[Row],
     selected: NodeId,
     inspector: bool,
+    sidebar_w: usize,
 ) {
-    fill_rect(buf, pw, ph, 0, 0, SIDEBAR_W, ph, STRIP_BG);
+    fill_rect(buf, pw, ph, 0, 0, sidebar_w, ph, STRIP_BG);
     // Title-bar band, shared with the terminal header so the top strip reads as
     // one continuous bar; holds the latched info toggle.
-    vgradient(buf, pw, ph, 0, 0, SIDEBAR_W, HEADER_H, HEAD_HI, HEAD_LO);
-    fill_rect(buf, pw, ph, 0, 0, SIDEBAR_W, 1, BEVEL_LT);
-    fill_rect(buf, pw, ph, 0, HEADER_H - 1, SIDEBAR_W, 1, BEVEL_DK);
+    vgradient(buf, pw, ph, 0, 0, sidebar_w, HEADER_H, HEAD_HI, HEAD_LO);
+    fill_rect(buf, pw, ph, 0, 0, sidebar_w, 1, BEVEL_LT);
+    fill_rect(buf, pw, ph, 0, HEADER_H - 1, sidebar_w, 1, BEVEL_DK);
     // 1px divider between the pane and the terminal.
-    fill_rect(buf, pw, ph, SIDEBAR_W - 1, 0, 1, ph, BEVEL_DK);
+    fill_rect(buf, pw, ph, sidebar_w - 1, 0, 1, ph, BEVEL_DK);
     // Info toggle: the same kind of text button as the window controls, latched
     // (drawn pressed) while the inspector pane is open.
     draw_button(buf, pw, ph, r, info_btn(), "i", inspector, true);
@@ -2395,24 +2543,39 @@ fn draw_sidebar(
     // so a sidebar row lines up pixel-for-pixel with the terminal row beside it.
     // Selection is a filled background, exactly how the terminal highlights its
     // own selected cells.
-    let (cw, rh) = (r.cell_w, r.cell_h);
+    let rh = r.cell_h;
+    let tops = sidebar_row_tops(rows, rh);
     for (i, row) in rows.iter().enumerate() {
-        let y = HEADER_H + i * rh;
+        let y = HEADER_H + tops[i];
         if y + rh > ph {
             break;
         }
         let is_sel = row.id == selected;
         if is_sel {
-            fill_rect(buf, pw, ph, 0, y, SIDEBAR_W - 1, rh, SEL);
+            fill_rect(buf, pw, ph, 0, y, sidebar_w - 1, rh, SEL);
         }
-        // No markers: hierarchy is the indentation alone (one character per
-        // depth level). Groups stay full-ink, leaves dim, so the structure
-        // still reads at a glance.
-        let name_x = row.depth * cw;
-        let name_w = SIDEBAR_W.saturating_sub(name_x);
+        // No indentation or markers: every node sits flush against the left
+        // edge. Hierarchy reads from colour alone — groups full-ink, leaves dim.
         let color = if is_sel || row.is_group { INK } else { INK_DIM };
-        draw_text(buf, pw, ph, r, name_x, y, name_w, &row.name, color);
+        draw_text(buf, pw, ph, r, 0, y, sidebar_w, &row.name, color);
     }
+}
+
+/// Top y of each sidebar row, relative to `HEADER_H`. A one-row blank spacer
+/// precedes every group except the first row, so groups read as separated
+/// blocks. Shared by [`draw_sidebar`] and `sidebar_hit` so the picture on screen
+/// and the click map can never disagree.
+fn sidebar_row_tops(rows: &[Row], rh: usize) -> Vec<usize> {
+    let mut tops = Vec::with_capacity(rows.len());
+    let mut y = 0;
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 && row.is_group {
+            y += rh; // blank line between group blocks
+        }
+        tops.push(y);
+        y += rh;
+    }
+    tops
 }
 
 /// A small bevelled Start/Stop popup at the cursor.
@@ -2600,13 +2763,16 @@ fn term_right(pw: usize, inspector: bool) -> usize {
     if inspector { panel_x(pw) } else { pw }
 }
 
-/// `[minimize, maximize, close]`, square, flush to the window's top-right.
+/// `[minimize, maximize, close]` traffic-light hit cells, full header height and
+/// `TLIGHT_CELL` wide, flush to the window's top-right with a small edge gap.
 fn win_btns(pw: usize) -> [Rect; 3] {
-    let c = pw.saturating_sub(WBTN_W);
+    let pad = 4; // gap from the right edge
+    let right = pw.saturating_sub(pad);
+    let w = TLIGHT_CELL;
     [
-        (c - 2 * WBTN_W, 0, WBTN_W, HEADER_H),
-        (c - WBTN_W, 0, WBTN_W, HEADER_H),
-        (c, 0, WBTN_W, HEADER_H),
+        (right.saturating_sub(3 * w), 0, w, HEADER_H), // minimize (leftmost)
+        (right.saturating_sub(2 * w), 0, w, HEADER_H), // maximize
+        (right.saturating_sub(w), 0, w, HEADER_H),     // close (rightmost)
     ]
 }
 
@@ -2883,10 +3049,12 @@ impl ApplicationHandler<UserEvent> for App {
             last_click: None,
             mods: ModifiersState::empty(),
             inspector: false,
+            sidebar_visible: true,
             focus: None,
             caret: 0,
             scroll_acc: 0.0,
             cursor: CursorIcon::Default,
+            win_hover: None,
         };
         self.state = Some(st);
 
@@ -3047,6 +3215,15 @@ impl ApplicationHandler<UserEvent> for App {
                             w.set_cursor(want);
                         }
                     }
+                    // Traffic-light hover: reveal the dots' glyphs while the
+                    // pointer is over any of them. Repaint only on a change.
+                    let hover = win_btns(pw)
+                        .iter()
+                        .position(|&r| hit(r, st.mouse.0, st.mouse.1));
+                    if hover != st.win_hover {
+                        st.win_hover = hover;
+                        st.request_redraw();
+                    }
                     if st.selecting {
                         if let Some(node) = st.shown() {
                             let size = st.sessions[&node].tab.size;
@@ -3101,8 +3278,11 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // 3. The sidebar "info" toggle (below WORKSPACE).
-                        if hit(info_btn(), mx, my) {
+                        // 3. The sidebar "info" toggle (only live while the
+                        // sidebar — which hosts the button — is shown).
+                        if self.state.as_ref().unwrap().sidebar_visible
+                            && hit(info_btn(), mx, my)
+                        {
                             self.toggle_inspector();
                             return;
                         }
@@ -3173,7 +3353,8 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         // 8. Terminal area: start a text selection.
                         let tr = term_right(pw, self.state.as_ref().unwrap().inspector);
-                        if mx >= SIDEBAR_W as f64
+                        let sw = self.state.as_ref().unwrap().sidebar_w();
+                        if mx >= sw as f64
                             && (mx as usize) < tr
                             && my >= HEADER_H as f64
                         {
@@ -3210,6 +3391,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     (MouseButton::Right, ElementState::Pressed) => {
                         let rows = self.state.as_ref().unwrap().tree.rows();
+                        let sw = self.state.as_ref().unwrap().sidebar_w();
                         if let Some((node, _)) =
                             self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
                         {
@@ -3217,7 +3399,7 @@ impl ApplicationHandler<UserEvent> for App {
                             st.selected = node;
                             st.focus = None;
                             st.ctx = Some(CtxMenu {
-                                x: (mx as usize).min(SIDEBAR_W),
+                                x: (mx as usize).min(sw),
                                 y: my as usize,
                                 node,
                             });
@@ -3282,6 +3464,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.stop(n);
                             }
                         }
+                        Shortcut::ToggleSidebar => self.toggle_sidebar(),
                     }
                     return;
                 }

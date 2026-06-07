@@ -65,10 +65,12 @@ impl Harness {
             last_click: None,
             mods: ModifiersState::empty(),
             inspector: false,
+            sidebar_visible: true,
             focus: None,
             caret: 0,
             scroll_acc: 0.0,
             cursor: winit::window::CursorIcon::Default,
+            win_hover: None,
         };
         let dir = std::env::temp_dir().join(format!(
             "termem-shots-{}-{}",
@@ -113,6 +115,19 @@ impl Harness {
     /// Show or hide the right inspector ("info") pane.
     pub fn inspector(&mut self, on: bool) -> &mut Self {
         self.state.inspector = on;
+        self
+    }
+
+    /// Show or hide the left sidebar tree pane (⌘B / Ctrl+Shift+B at runtime).
+    pub fn sidebar(&mut self, on: bool) -> &mut Self {
+        self.state.sidebar_visible = on;
+        self
+    }
+
+    /// Simulate the pointer hovering a window-control "traffic light"
+    /// (`0`=minimize, `1`=maximize, `2`=close), or `None` to clear hover.
+    pub fn hover_win(&mut self, which: Option<usize>) -> &mut Self {
+        self.state.win_hover = which;
         self
     }
 
